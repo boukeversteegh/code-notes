@@ -55,8 +55,8 @@ let shared: string;
 test("a note added in one clone is readable in another after sync", () => {
   shared = manualNote(new NoteStore(a), "a.txt", 3, 4, "Remember the edge case on these lines.");
   assert.match(cli(a, "show", "a.txt"), /Remember the edge case/);
-  assert.match(cli(a, "sync"), /Pushed/);
-  assert.match(cli(b, "sync"), /merged|Pushed/);
+  assert.match(cli(a, "sync"), /Pushed to origin/);
+  assert.match(cli(b, "sync"), /Pulled from origin: \d+ notes? merged/);
   const shown = cli(b, "show", "a.txt");
   assert.match(shown, /Remember the edge case/);
   assert.match(shown, new RegExp(`key: \`${shared}\``));
@@ -68,8 +68,8 @@ test("push is rejected while the remote has notes that are not here; pull merges
   cli(b, "push");
   const fromA = manualNote(new NoteStore(a), "a.txt", 5, 5, "Written in A.");
   assert.throws(() => cli(a, "push"), /Push rejected/);
-  assert.match(cli(a, "pull"), /Pulled: 1 notes merged/);
-  assert.match(cli(a, "push"), /Pushed/);
+  assert.match(cli(a, "pull"), /Pulled from origin: 1 note merged/);
+  assert.match(cli(a, "push"), /Pushed to origin/);
   cli(b, "pull");
   const shown = cli(b, "show", "a.txt");
   assert.match(shown, /Written in A/);

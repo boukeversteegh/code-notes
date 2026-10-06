@@ -314,8 +314,12 @@ export class NoteStore {
     const ours = this.head();
     if (ours === theirs) return 0;
     if (!ours || this.isAncestor(ours, theirs)) {
+      // The remote's notes include ours: take them over, and count the notes that changed.
+      const changed = ours
+        ? this.git(["diff-tree", "-r", "--name-only", "--no-renames", ours, theirs]).split("\n").filter(Boolean).length
+        : this.listEntries(theirs).length;
       this.git(["update-ref", "-m", "code-notes: fast-forward", this.ref, theirs, ours ?? ZERO]);
-      return 0;
+      return changed;
     }
     if (this.isAncestor(theirs, ours)) return 0;
     let merged = 0;
@@ -367,9 +371,11 @@ export class NoteStore {
    * Pushes the local notes. A push is never forced: when the remote has notes that are not here yet,
    * it is rejected and a pull (or sync) has to merge them first.
    */
-  push(remote = this.remote(), remoteHead?: string | null): "pushed" | "rejected" | "nothing" {
+  push(remote = this.remote(), remoteHead?: string | null): "pushed" | "rejected" | "up-to-date" | "no-notes" {
     const head = this.head();
-    if (!head || head === remoteHead) return "nothing"; // the remote already has these notes
+    if (!head) return "no-notes";
+    if (remoteHead === undefined) remoteHead = NoteStore.remoteHead(this.git(["ls-remote", remote, this.ref]));
+    if (head === remoteHead) return "up-to-date"; // the remote already has these notes
     const r = spawnSync("git", ["push", "-q", remote, `${this.ref}:${this.ref}`], { cwd: this.root, encoding: "utf8" });
     if (r.status === 0) return "pushed";
     if (/rejected|non-fast-forward|fetch first/i.test(r.stderr)) return "rejected";

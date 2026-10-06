@@ -48,10 +48,11 @@ git fetch https://github.com/<owner>/<repo>.git '+refs/pull/*/head:refs/code-not
 
 ## VS Code extension
 
-- Notes appear as comment threads on their lines and in the Comments panel. A bar in the gutter marks the lines a note covers, and files with notes get a 💬 badge in the Explorer.
+- Notes of the files visible in an editor appear as comment threads on their lines and in the Comments panel; files that are not visible show no notes, so the panel stays about what you are looking at. Each thread header is a status line: lines, PR or author, GitHub state, whether the code changed since, number of replies. A bar in the gutter marks the lines a note covers, and files with notes get a 💬 badge in the Explorer.
 - Add a note with the `+` in the gutter or **Add code note** in the editor context menu; select several lines for a multi-line note. Reply, edit your own comments, or delete a note with the trash icon (you are asked for a reason).
 - Imported notes link to their GitHub conversation, show whether it is open or resolved on GitHub, and can resolve or reopen it. Deleting a note whose conversation is still open posts your reason on GitHub and resolves the conversation; a note from a resolved conversation is only removed locally.
 - Whether a conversation is resolved is not stored in the notes: a note either exists or is deleted. The state is looked up on GitHub when a note is shown and cached for five minutes in `<git-common-dir>/code-notes/github-thread-states.json`, shared by the CLI, the extension and all worktrees.
+- All git work runs in a background worker thread, so the editor stays responsive on a busy machine. The status bar shows what the extension is doing (loading notes, syncing, saving, importing) and when it last synced; clicking it syncs.
 - Changes are synced right away (`codeNotes.syncOnChange`), and notes from other clones are pulled when the window gains focus and every `codeNotes.pullInterval` seconds (default 60).
 - Commands: **Code Notes: Refresh notes** (sync with the remote and redraw; also the refresh icon in the Comments panel), **Sync notes with remote**, **Import GitHub review conversations into notes**. `codeNotes.importLimit` caps the number of PRs fetched per import.
 

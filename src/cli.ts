@@ -168,20 +168,31 @@ function comment(): void {
   console.log(doc ? `Commented on note ${key}.` : `No note ${key}.`);
 }
 
+const remoteName = () => values.remote ?? store().remote();
+
+function pullMessage(remote: string, r: { fetched: boolean; merged: number }): string {
+  if (!r.fetched) return `${remote} has no notes yet.`;
+  return r.merged ? `Pulled from ${remote}: ${r.merged} note${r.merged === 1 ? "" : "s"} merged.` : `Nothing new on ${remote}.`;
+}
+
 function pull(): void {
-  const r = store().pull(values.remote);
-  console.log(r.fetched ? `Pulled: ${r.merged} notes merged from the remote.` : "The remote has no notes yet.");
+  const remote = remoteName();
+  console.log(pullMessage(remote, store().pull(remote)));
 }
 
 function push(): void {
-  const r = store().push(values.remote);
-  if (r === "rejected") throw new Error("Push rejected: the remote has notes that are not here yet. Run `code-notes pull` or `code-notes sync` first.");
-  console.log(r === "pushed" ? "Pushed." : "No notes to push.");
+  const remote = remoteName();
+  const r = store().push(remote);
+  if (r === "rejected") throw new Error(`Push rejected: ${remote} has notes that are not here yet. Run \`code-notes pull\` or \`code-notes sync\` first.`);
+  console.log(r === "pushed" ? `Pushed to ${remote}.` : r === "up-to-date" ? `${remote} is already up to date.` : "There are no notes to push yet.");
 }
 
 function syncNotes(): void {
-  const r = store().sync(values.remote);
-  console.log(`${r.fetched ? `Pulled: ${r.merged} notes merged from the remote.` : "The remote has no notes yet."} ${r.pushed ? "Pushed." : "No notes to push."}`);
+  const remote = remoteName();
+  const s = store();
+  const r = s.sync(remote);
+  const pushed = r.pushed ? `Pushed to ${remote}.` : s.head() ? `${remote} is up to date.` : "There are no notes yet.";
+  console.log(`${pullMessage(remote, r)} ${pushed}`);
 }
 
 async function importNotes(): Promise<void> {

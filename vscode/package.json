@@ -2,7 +2,7 @@
   "name": "code-notes",
   "displayName": "Code Notes: PR review history",
   "description": "Shared code notes stored in git notes: past GitHub PR review conversations and notes you write, shown on the lines they belong to.",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "publisher": "boukeversteegh",
   "private": true,
   "engines": {
@@ -247,7 +247,7 @@
     }
   },
   "scripts": {
-    "build": "esbuild src/extension.ts --bundle --platform=node --target=node20 --format=cjs --external:vscode --outfile=dist/extension.js",
+    "build": "esbuild src/extension.ts src/worker.ts --bundle --platform=node --target=node20 --format=cjs --external:vscode --outdir=dist",
     "typecheck": "tsc",
     "package": "npm run build && vsce package --no-dependencies --skip-license -o code-notes.vsix"
   },

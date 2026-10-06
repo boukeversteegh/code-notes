@@ -1,29 +1,23 @@
-import { type FSWatcher, existsSync, mkdirSync, statSync, watch } from "node:fs";
+import { type FSWatcher, existsSync, mkdirSync, watch } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
+import { Worker } from "node:worker_threads";
 import * as vscode from "vscode";
 import { type Located, buildAnchor } from "../../src/anchor.ts";
-import { Cache } from "../../src/cache.ts";
 import { describeLines, describeMatch, originalCode, withoutEmail } from "../../src/format.ts";
-import { type NoteDoc, NoteStore, keyFor, newManualId } from "../../src/gitnotes.ts";
+import { type NoteDoc, keyFor, newManualId } from "../../src/gitnotes.ts";
 import { githubDeletionReply, setGithubToken, setThreadResolved } from "../../src/github.ts";
+import type { FileNote } from "../../src/notes.ts";
+import { toRepoPath } from "../../src/repo.ts";
 import { ThreadStates } from "../../src/thread-states.ts";
-import { importFromCache } from "../../src/importer.ts";
-import { type FileNote, RepoNotes, gitDirs } from "../../src/notes.ts";
-import { detectRepo, gitRoot, toRepoPath } from "../../src/repo.ts";
-import { fetchPrsIntoCache } from "../../src/fetch-prs.ts";
-import { placeNotes } from "../../src/tracking.ts";
-
-interface RepoInfo {
-  root: string;
-  gitDir: string;
-  commonDir: string;
-}
+import type { RepoInfo } from "./worker.ts";
 
 interface ThreadInfo {
   root: string;
   key: string;
   doc: NoteDoc;
 }
+
+type SyncResult = { fetched: boolean; merged: number; pushed: boolean };
 
 /** A comment in a note thread; comments written locally can be edited in place. */
 class NoteComment implements vscode.Comment {
@@ -50,53 +44,101 @@ class NoteComment implements vscode.Comment {
   }
 }
 
-const mtime = (file: string) => {
-  try {
-    return String(statSync(file).mtimeMs);
-  } catch {
-    return "-";
-  }
+/** What the status bar says while an operation runs; operations not listed here are too quick to mention. */
+const ACTIVITY: Record<string, string> = {
+  notesForFile: "loading notes",
+  count: "loading notes",
+  sync: "syncing",
+  createNote: "saving",
+  addComment: "saving",
+  editComment: "saving",
+  removeComment: "saving",
+  softDelete: "saving",
+  importGithub: "importing from GitHub",
 };
 
-/**
- * Notes per checkout, reloaded when the notes ref changes (a write here, in another worktree, by the CLI or
- * by a sync) or when HEAD moves (renames are resolved against HEAD). The notes ref is shared by all
- * worktrees, so it is looked up in the common git dir; HEAD is per worktree.
- */
-class NotesCache {
-  private loaded = new Map<string, { key: string; notes: RepoNotes }>();
+/** Requests to the git worker (see worker.ts); every git call happens there, off the extension host thread. */
+class GitWorker {
+  private readonly worker: Worker;
+  private nextId = 0;
+  private readonly pending = new Map<number, { op: string; resolve: (v: any) => void; reject: (e: Error) => void; log?: (m: string) => void }>();
+  /** Called when the set of running operations changes, with the activities still running. */
+  onBusyChange: (activities: string[]) => void = () => {};
 
-  get(info: RepoInfo): RepoNotes {
-    const key = [
-      join(info.commonDir, "refs", "notes", "code-notes"),
-      join(info.commonDir, "packed-refs"),
-      join(info.gitDir, "logs", "HEAD"),
-    ].map(mtime).join("|");
-    const entry = this.loaded.get(info.root);
-    if (entry?.key === key) return entry.notes;
-    const notes = RepoNotes.load(info.root);
-    this.loaded.set(info.root, { key, notes });
-    return notes;
+  constructor(file: string) {
+    this.worker = new Worker(file);
+    this.worker.on("message", ({ id, result, error, log }: { id: number; result?: unknown; error?: string; log?: string }) => {
+      const p = this.pending.get(id);
+      if (!p) return;
+      if (log !== undefined) return p.log?.(log);
+      this.pending.delete(id);
+      if (ACTIVITY[p.op]) this.onBusyChange(this.activities());
+      if (error !== undefined) p.reject(new Error(error));
+      else p.resolve(result);
+    });
+  }
+
+  activities(): string[] {
+    return [...new Set([...this.pending.values()].flatMap((p) => (ACTIVITY[p.op] ? [ACTIVITY[p.op]] : [])))];
+  }
+
+  call<T>(op: string, args: Record<string, unknown>, log?: (msg: string) => void): Promise<T> {
+    const id = this.nextId++;
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { op, resolve, reject, log });
+      if (ACTIVITY[op]) this.onBusyChange(this.activities());
+      this.worker.postMessage({ id, op, args });
+    });
+  }
+
+  dispose(): void {
+    this.worker.terminate();
   }
 }
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Code Notes");
   const controller = vscode.comments.createCommentController("code-notes", "Code notes");
-  const notesCache = new NotesCache();
+  const git = new GitWorker(join(__dirname, "worker.js"));
   /** Rendered threads per document, by note key, with a signature of what they show, so re-renders update in place. */
   const threadsByDoc = new Map<string, Map<string, { thread: vscode.CommentThread; signature: string }>>();
+  /** Latest render per document; an older render that finishes later is discarded. */
+  const renderGeneration = new Map<string, number>();
   /** Notes you replied to, edited or created in this session; they stay open through re-renders. */
   const keepOpen = new Set<string>();
   const threadsOf = (doc: vscode.TextDocument) => [...(threadsByDoc.get(doc.uri.toString())?.values() ?? [])].map((r) => r.thread);
   const threadInfo = new WeakMap<vscode.CommentThread, ThreadInfo>();
-  const repoByDir = new Map<string, RepoInfo | null>();
+  const repoByDir = new Map<string, Promise<RepoInfo | null>>();
   const knownRepos: RepoInfo[] = [];
+  const authors = new Map<string, string>();
   const refWatchers = new Map<string, FSWatcher[]>();
   /** Threads whose GitHub state is being looked up, so a render does not start a second lookup. */
   const lookingUp = new Set<string>();
 
   const log = (msg: string) => output.appendLine(`[${new Date().toLocaleTimeString()}] ${msg}`);
+
+  /**
+   * Status bar: what the extension is doing (with a spinner), or when it last synced. Short operations do not
+   * show the spinner, so it does not flicker. Clicking it refreshes (syncs) the notes.
+   */
+  const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
+  status.command = "codeNotes.refresh";
+  let lastSync: Date | null = null;
+  let statusTimer: NodeJS.Timeout | undefined;
+  const showIdle = () => {
+    status.text = "$(comment-discussion) Code Notes";
+    status.tooltip = `Code Notes${lastSync ? ` · last synced ${lastSync.toLocaleTimeString()}` : ""}\nClick to sync notes with the remote.`;
+  };
+  git.onBusyChange = (activities) => {
+    clearTimeout(statusTimer);
+    if (activities.length === 0) return showIdle();
+    statusTimer = setTimeout(() => {
+      status.text = `$(sync~spin) Code Notes: ${activities.join(", ")}…`;
+      status.tooltip = "Code Notes is working in the background.";
+    }, 300);
+  };
+  showIdle();
+  status.show();
 
   /** Runs a command handler, reporting failures instead of failing silently. */
   const guarded = <A extends unknown[]>(name: string, fn: (...args: A) => unknown) => async (...args: A) => {
@@ -107,57 +149,56 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.window.showErrorMessage(`Code Notes: ${name} failed: ${(err as Error).message}`);
     }
   };
+  const background = (name: string, work: Promise<unknown>) => work.catch((err) => log(`${name} failed: ${(err as Error).message}`));
 
-  const repoFor = (filePath: string): RepoInfo | null => {
-    const dir = dirname(filePath);
-    // Explorer decorations ask about every visible folder; reuse a known root instead of spawning git.
-    const known = knownRepos.find((r) => isWithin(r.root, dir));
+  // ---- Repositories ----
+
+  const knownRepoFor = (filePath: string) => knownRepos.find((r) => isWithin(r.root, dirname(filePath)));
+
+  /** The repository of a file; the first lookup per repository happens in the worker. */
+  const repoFor = async (filePath: string): Promise<RepoInfo | null> => {
+    const known = knownRepoFor(filePath);
     if (known) return known;
+    const dir = dirname(filePath);
     if (!repoByDir.has(dir)) {
-      try {
-        const root = gitRoot(dir);
-        const info = { root, ...gitDirs(root) };
+      repoByDir.set(dir, git.call<RepoInfo | null>("repoInfo", { dir }).then((info) => {
+        if (!info) return null;
+        const existing = knownRepos.find((r) => r.root === info.root);
+        if (existing) return existing;
         knownRepos.push(info);
-        repoByDir.set(dir, info);
         watchNotesRef(info);
-        setTimeout(() => new NoteStore(root).author(), 0); // look up the git identity once, before the first reply
+        background("looking up the git identity", git.call<string>("author", { root: info.root }).then((a) => authors.set(info.root, a)));
         // Pull right away, so a fresh clone shows the shared notes without waiting for the next periodic pull.
-        // The ref watcher re-renders when the pull brings notes.
-        setTimeout(() => syncRepo(root).catch((err) => log(`pull ${root} failed: ${(err as Error).message}`)), 0);
-      } catch {
-        repoByDir.set(dir, null);
-      }
+        background(`pull ${info.root}`, syncRepo(info.root));
+        return info;
+      }));
     }
     return repoByDir.get(dir)!;
   };
 
-  /** Re-renders when the shared notes ref changes, e.g. after a write in another worktree or a CLI sync. */
+  /** Re-renders when the shared notes ref points to a new commit (a write here, in another worktree, by the CLI or a sync). */
   const watchNotesRef = (info: RepoInfo) => {
     if (refWatchers.has(info.commonDir)) return;
     const notesDir = join(info.commonDir, "refs", "notes");
     mkdirSync(notesDir, { recursive: true });
     let timer: NodeJS.Timeout | undefined;
-    let lastHead = new NoteStore(info.root).head();
+    let lastHead: string | null | undefined;
+    background("reading the notes ref", git.call<string | null>("head", { root: info.root }).then((h) => (lastHead ??= h)));
     const changed = () => {
       clearTimeout(timer);
-      timer = setTimeout(() => {
+      timer = setTimeout(() => background("reading the notes ref", git.call<string | null>("head", { root: info.root }).then((head) => {
         // Lock files and rewrites of the same value also trigger the watcher; only a new notes commit matters.
-        const head = new NoteStore(info.root).head();
         if (head === lastHead) return;
         lastHead = head;
         renderAll();
-      }, 300);
+      })), 300);
     };
     const watchers = [watch(notesDir, changed)];
     if (existsSync(join(info.commonDir, "packed-refs"))) watchers.push(watch(join(info.commonDir, "packed-refs"), changed));
     refWatchers.set(info.commonDir, watchers);
   };
 
-  const notesFor = (filePath: string): { info: RepoInfo; notes: FileNote[] } | null => {
-    const info = repoFor(filePath);
-    if (!info) return null;
-    return { info, notes: notesCache.get(info).forFile(toRepoPath(filePath, info.root, info.root)) };
-  };
+  // ---- Rendering: only files visible in an editor show notes (and appear in the Comments panel) ----
 
   /** Marks the lines a note covers: a bar in the gutter and a mark in the overview ruler. */
   const rangeDecoration = vscode.window.createTextEditorDecorationType({
@@ -175,27 +216,42 @@ export function activate(context: vscode.ExtensionContext): void {
   const showRangesFor = (doc: vscode.TextDocument) =>
     vscode.window.visibleTextEditors.filter((e) => e.document === doc).forEach(showRanges);
 
+  const visibleDocuments = () => [...new Set(vscode.window.visibleTextEditors.map((e) => e.document))];
+
   const clear = (doc: vscode.TextDocument) => {
+    renderGeneration.set(doc.uri.toString(), (renderGeneration.get(doc.uri.toString()) ?? 0) + 1);
     threadsOf(doc).forEach((t) => t.dispose());
     threadsByDoc.delete(doc.uri.toString());
   };
 
   /**
-   * Shows the notes of a document. Threads are matched to notes by key: unchanged notes keep their thread
-   * untouched (so an open note stays open), changed notes are updated in place, and only new or removed
-   * notes create or dispose threads.
+   * Shows the notes of a document. Notes are loaded and placed in the worker. Threads are matched to notes by
+   * key: unchanged notes keep their thread untouched (so an open note stays open), changed notes are updated
+   * in place, and only new or removed notes create or dispose threads.
    */
-  const render = (doc: vscode.TextDocument) => {
+  const render = async (doc: vscode.TextDocument) => {
     const uri = doc.uri.toString();
+    const generation = (renderGeneration.get(uri) ?? 0) + 1;
+    renderGeneration.set(uri, generation);
+    let found: { info: RepoInfo; notes: FileNote[]; placed: (Located | null)[] } | null = null;
+    if (doc.uri.scheme === "file") {
+      const info = await repoFor(doc.uri.fsPath);
+      if (info) {
+        const r = await git.call<{ notes: FileNote[]; placed: (Located | null)[] }>("notesForFile", {
+          info, path: toRepoPath(doc.uri.fsPath, info.root, info.root), lines: doc.getText().split(/\r?\n/),
+        });
+        found = { info, ...r };
+      }
+    }
+    // A newer render started, or the file is no longer visible, while this one waited for the worker.
+    if (renderGeneration.get(uri) !== generation || !visibleDocuments().includes(doc)) return;
     const previous = threadsByDoc.get(uri) ?? new Map<string, { thread: vscode.CommentThread; signature: string }>();
     const next = new Map<string, { thread: vscode.CommentThread; signature: string }>();
-    const found = doc.uri.scheme === "file" ? notesFor(doc.uri.fsPath) : null;
     if (found && found.notes.length > 0) {
-      const lines = doc.getText().split(/\r?\n/);
-      const placed = placeNotes(found.info.root, found.notes.map((n) => n.doc), lines);
+      const { info, notes, placed } = found;
       const expand = vscode.workspace.getConfiguration("codeNotes").get<"none" | "all">("expand", "none");
-      const states = new ThreadStates(found.info.root);
-      found.notes.forEach((note, i) => {
+      const states = new ThreadStates(info.root);
+      notes.forEach((note, i) => {
         const resolved = note.doc.github ? states.get(note.doc.github.threadId) : undefined;
         const signature = JSON.stringify([note.doc, placed[i], resolved, note.originalPath]);
         const old = previous.get(note.key);
@@ -204,12 +260,12 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
         const thread = old?.thread ?? createThread(controller, doc, expand);
-        fillThread(thread, doc, found.info.root, note, placed[i], resolved);
+        fillThread(thread, doc, info.root, note, placed[i], resolved);
         if (keepOpen.has(note.key)) thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
-        threadInfo.set(thread, { root: found.info.root, key: note.key, doc: note.doc });
+        threadInfo.set(thread, { root: info.root, key: note.key, doc: note.doc });
         next.set(note.key, { thread, signature });
       });
-      refreshGithubStates(found.info.root, found.notes, doc.uri.fsPath);
+      refreshGithubStates(info.root, notes, doc.uri.fsPath);
     }
     for (const [key, r] of previous) if (!next.has(key)) r.thread.dispose();
     if (next.size) threadsByDoc.set(uri, next);
@@ -217,34 +273,52 @@ export function activate(context: vscode.ExtensionContext): void {
     showRangesFor(doc);
   };
 
-  /** Re-renders the open documents of one file path, e.g. after a write. */
+  const renderDoc = (doc: vscode.TextDocument) => background(`showing notes of ${doc.uri.fsPath}`, render(doc));
+
+  /** Re-renders the visible documents of one file path, e.g. after a write. */
   const renderPath = (fsPath: string) => {
-    vscode.workspace.textDocuments.filter((d) => d.uri.fsPath === fsPath).forEach(render);
+    visibleDocuments().filter((d) => d.uri.fsPath === fsPath).forEach(renderDoc);
     decorationsChanged.fire(vscode.Uri.file(fsPath));
+  };
+
+  const renderAll = () => {
+    visibleDocuments().forEach(renderDoc);
+    decorationsChanged.fire(undefined);
+  };
+
+  /** Shows notes for files that became visible and removes them from files that are no longer visible. */
+  const visibleChanged = (editors: readonly vscode.TextEditor[]) => {
+    const visible = new Set(editors.map((e) => e.document.uri.toString()));
+    for (const [uri, rendered] of threadsByDoc) {
+      if (visible.has(uri)) continue;
+      renderGeneration.set(uri, (renderGeneration.get(uri) ?? 0) + 1); // cancel a render still in progress
+      for (const r of rendered.values()) r.thread.dispose();
+      threadsByDoc.delete(uri);
+    }
+    for (const doc of new Set(editors.map((e) => e.document))) {
+      if (threadsByDoc.has(doc.uri.toString())) showRangesFor(doc);
+      else renderDoc(doc);
+    }
   };
 
   // VS Code only requests decorations for items rendered in the Explorer (and open tabs).
   const decorationsChanged = new vscode.EventEmitter<vscode.Uri | undefined>();
   const decorations: vscode.FileDecorationProvider = {
     onDidChangeFileDecorations: decorationsChanged.event,
-    provideFileDecoration(uri) {
+    async provideFileDecoration(uri) {
       if (uri.scheme !== "file") return;
-      const info = repoFor(uri.fsPath);
-      const count = info ? notesCache.get(info).count(toRepoPath(uri.fsPath, info.root, info.root)) : 0;
+      const info = await repoFor(uri.fsPath);
+      if (!info) return;
+      const count = await git.call<number>("count", { info, path: toRepoPath(uri.fsPath, info.root, info.root) });
       if (!count) return;
       return new vscode.FileDecoration("💬", `${count} code note${count === 1 ? "" : "s"}`);
     },
   };
 
-  const renderAll = () => {
-    vscode.workspace.textDocuments.forEach(render);
-    decorationsChanged.fire(undefined);
-  };
-
   // Every line of a file in a git repo can get a new note.
   controller.commentingRangeProvider = {
-    provideCommentingRanges: (doc) =>
-      doc.uri.scheme === "file" && repoFor(doc.uri.fsPath) ? [new vscode.Range(0, 0, Math.max(doc.lineCount - 1, 0), 0)] : [],
+    provideCommentingRanges: async (doc) =>
+      doc.uri.scheme === "file" && (await repoFor(doc.uri.fsPath)) ? [new vscode.Range(0, 0, Math.max(doc.lineCount - 1, 0), 0)] : [],
   };
   controller.options = { placeHolder: "Write a code note…", prompt: "Add a code note" };
 
@@ -253,7 +327,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const githubSession = async (interactive: boolean) => {
     const session = await vscode.authentication.getSession("github", ["repo"], interactive ? { createIfNone: true } : { silent: true });
     if (session) setGithubToken(session.accessToken);
-    return !!session;
+    return session?.accessToken;
   };
 
   /**
@@ -290,21 +364,18 @@ export function activate(context: vscode.ExtensionContext): void {
     if (url) vscode.env.openExternal(vscode.Uri.parse(url));
   };
 
-  // ---- Sync ----
+  // ---- Sync (in the worker) ----
 
-  /** Pushes and pulls notes in the background after a change, when enabled and a remote is configured. */
+  /** Pushes and pulls notes in the background after a change, when enabled. */
   const syncAfterChange = (root: string) => {
     if (!vscode.workspace.getConfiguration("codeNotes").get<boolean>("syncOnChange", true)) return;
-    syncRepo(root).catch((err) => log(`sync ${root} failed: ${(err as Error).message}`));
+    background(`sync ${root}`, syncRepo(root));
   };
 
   /** Running sync per repo; a change made while one runs queues exactly one follow-up sync. */
-  const syncing = new Map<string, Promise<{ fetched: boolean; merged: number; pushed: boolean } | null>>();
+  const syncing = new Map<string, Promise<SyncResult | null>>();
   const queued = new Set<string>();
-  /** Background sync of one repo; the network steps do not block the extension host. */
-  const syncRepo = async (root: string): Promise<{ fetched: boolean; merged: number; pushed: boolean } | null> => {
-    const store = new NoteStore(root);
-    if (!store.defaultRemote()) return null; // no remote: notes stay local
+  const syncRepo = async (root: string): Promise<SyncResult | null> => {
     const running = syncing.get(root);
     if (running) {
       if (queued.has(root)) return running;
@@ -313,10 +384,14 @@ export function activate(context: vscode.ExtensionContext): void {
       queued.delete(root);
       return syncRepo(root);
     }
-    const run = store.syncAsync().then((r) => {
+    const run = (async () => {
+      if (!(await git.call<string | null>("defaultRemote", { root }))) return null; // no remote: notes stay local
+      const r = await git.call<SyncResult>("sync", { root });
+      lastSync = new Date();
+      if (!git.activities().length) showIdle();
       if (r.merged || r.pushed) log(`sync ${root}: merged ${r.merged}, pushed ${r.pushed}`);
       return r;
-    });
+    })();
     syncing.set(root, run);
     try {
       return await run;
@@ -327,9 +402,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   /** Pulls notes for every repo seen so far: when the window gains focus and every `codeNotes.pullInterval` seconds. */
   const pullAll = () => {
-    for (const info of new Map(knownRepos.map((r) => [r.commonDir, r])).values()) {
-      syncRepo(info.root).catch((err) => log(`pull ${info.root} failed: ${(err as Error).message}`));
-    }
+    for (const info of new Map(knownRepos.map((r) => [r.commonDir, r])).values()) background(`pull ${info.root}`, syncRepo(info.root));
   };
   let pullTimer: NodeJS.Timeout | undefined;
   const schedulePull = () => {
@@ -339,14 +412,25 @@ export function activate(context: vscode.ExtensionContext): void {
   };
   schedulePull();
 
-  // ---- Writing ----
+  const authorOf = async (root: string) => authors.get(root) ?? (await git.call<string>("author", { root }));
 
-  const createNote = (reply: vscode.CommentReply) => {
+  // ---- Writing: the UI updates first, the worker writes, then the file is re-rendered ----
+
+  /** Disables replying on a thread while a write is running, so nothing is posted twice. */
+  const whileSaving = async (thread: vscode.CommentThread, work: () => Promise<unknown>) => {
+    thread.canReply = false;
+    try {
+      await work();
+    } finally {
+      thread.canReply = true;
+    }
+  };
+
+  const createNote = async (reply: vscode.CommentReply) => {
     const doc = vscode.workspace.textDocuments.find((d) => d.uri.toString() === reply.thread.uri.toString());
-    const info = repoFor(reply.thread.uri.fsPath);
     if (!doc) throw new Error("the document of this note is not open");
+    const info = await repoFor(reply.thread.uri.fsPath);
     if (!info) throw new Error(`${reply.thread.uri.fsPath} is not inside a git repository`);
-    const store = new NoteStore(info.root);
     const path = toRepoPath(reply.thread.uri.fsPath, info.root, info.root);
     const lines = doc.getText().split(/\r?\n/);
     let anchor;
@@ -355,33 +439,32 @@ export function activate(context: vscode.ExtensionContext): void {
       const { start: from, end: to } = reply.thread.range;
       const start = from.line + 1;
       const end = Math.max(start, to.character === 0 && to.line > from.line ? to.line : to.line + 1);
-      anchor = buildAnchor(lines, start, end, doc.isDirty ? null : store.git(["rev-parse", "HEAD"]).trim());
+      anchor = buildAnchor(lines, start, end, null);
     } else {
       anchor = { commit: null, startLine: null, endLine: null, text: null }; // a note on the whole file
     }
     const id = newManualId(), now = new Date().toISOString(), key = keyFor(id);
+    const author = await authorOf(info.root);
     const note: NoteDoc = {
       schema: 1, id, source: "manual", path, anchor,
-      summary: null, comments: [{ author: store.author(), body: reply.text, createdAt: now, source: "local" }],
+      summary: null, comments: [{ author, body: reply.text, createdAt: now, source: "local" }],
       pr: null, createdAt: now, updatedAt: now, deleted: null, restoredAt: null,
     };
-    // Show the note right away; writing it to git notes and syncing follow in the background.
+    // Show the note right away; the worker writes it (anchored to HEAD unless the file has unsaved changes).
     reply.thread.dispose();
     const range = anchor.endLine ? { start: anchor.startLine!, end: anchor.endLine, match: "exact" as const } : null;
     const shown = createThread(controller, doc, "all");
     keepOpen.add(key);
-    fillThread(shown, doc, info.root, { key, doc: note, originalPath: null }, range);
+    fillThread(shown, doc, info.root, { key, doc: note, originalPath: null }, range, undefined, "saving…");
     threadInfo.set(shown, { root: info.root, key, doc: note });
     const rendered = threadsByDoc.get(doc.uri.toString()) ?? new Map();
     rendered.set(key, { thread: shown, signature: "" });
     threadsByDoc.set(doc.uri.toString(), rendered);
     showRangesFor(doc);
-    setTimeout(guarded("saving the note", () => {
-      store.put(key, `code-notes: add note on ${path}`, () => note);
-      log(`added note ${key} on ${path}:${describeLines(range)}`);
-      renderPath(doc.uri.fsPath);
-      syncAfterChange(info.root);
-    }), 0);
+    await whileSaving(shown, () => git.call("createNote", { root: info.root, key, doc: note, anchorToHead: !doc.isDirty && !!anchor.endLine }));
+    log(`added note ${key} on ${path}:${describeLines(range)}`);
+    renderPath(doc.uri.fsPath);
+    syncAfterChange(info.root);
   };
 
   /** Opens an empty note box on the selected lines; the same as the gutter `+`, for when that is not available. */
@@ -394,37 +477,31 @@ export function activate(context: vscode.ExtensionContext): void {
     thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
   };
 
-  const replyNote = (reply: vscode.CommentReply) => {
+  const replyNote = async (reply: vscode.CommentReply) => {
     const t = threadInfo.get(reply.thread);
     if (!t) return;
-    const store = new NoteStore(t.root);
-    const author = store.author();
+    const author = await authorOf(t.root);
     const createdAt = new Date().toISOString();
-    // Show the reply right away and return, so the reply box clears; writing and syncing follow in the background.
-    const shown = new NoteComment(reply.text, { name: withoutEmail(author) }, new Date(createdAt), t.root, t.key, reply.thread.comments.length, true, undefined, createdAt);
+    // Show the reply right away, marked as saving; replying is disabled until the worker has written it.
+    const shown = new NoteComment(reply.text, { name: withoutEmail(author) }, new Date(createdAt), t.root, t.key, reply.thread.comments.length, true, "saving…", createdAt);
     shown.thread = reply.thread;
     reply.thread.comments = [...reply.thread.comments, shown];
     keepOpen.add(t.key);
     reply.thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
-    setTimeout(guarded("saving the reply", () => {
-      store.addComment(t.key, { author, body: reply.text, createdAt });
-      renderPath(reply.thread.uri.fsPath);
-      syncAfterChange(t.root);
-    }), 0);
+    await whileSaving(reply.thread, () => git.call("addComment", { root: t.root, key: t.key, comment: { author, body: reply.text, createdAt } }));
+    renderPath(reply.thread.uri.fsPath);
+    syncAfterChange(t.root);
   };
 
   /** Removes one of your own replies from a note. */
-  const deleteComment = (comment: NoteComment) => {
+  const deleteComment = async (comment: NoteComment) => {
     const thread = comment.thread;
     if (!thread || !comment.createdAt) return;
     thread.comments = thread.comments.filter((c) => c !== comment); // remove it from view right away
-    setTimeout(guarded("removing the reply", () => {
-      if (!new NoteStore(comment.root).removeComment(comment.key, comment.index, comment.createdAt!)) {
-        throw new Error("the reply changed in the meantime; refresh and try again");
-      }
-      renderPath(thread.uri.fsPath);
-      syncAfterChange(comment.root);
-    }), 0);
+    const removed = await git.call<boolean>("removeComment", { root: comment.root, key: comment.key, index: comment.index, createdAt: comment.createdAt });
+    if (!removed) throw new Error("the reply changed in the meantime; refresh and try again");
+    renderPath(thread.uri.fsPath);
+    syncAfterChange(comment.root);
   };
 
   /** Deletes a note; invoked from the thread header or from its first comment. */
@@ -438,9 +515,8 @@ export function activate(context: vscode.ExtensionContext): void {
     const fsPath = thread.uri.fsPath;
     thread.dispose(); // remove it from view right away
     threadsByDoc.get(thread.uri.toString())?.delete(t.key);
-    const store = new NoteStore(t.root);
     const justification = reason || "deleted in VS Code";
-    store.softDelete(t.key, store.author(), justification);
+    await git.call("softDelete", { root: t.root, key: t.key, by: await authorOf(t.root), reason: justification });
     log(`deleted note ${t.key}`);
     renderPath(fsPath);
     syncAfterChange(t.root);
@@ -467,14 +543,15 @@ export function activate(context: vscode.ExtensionContext): void {
       c === comment ? Object.assign(comment, { mode: vscode.CommentMode.Editing, body: comment.savedBody }) : c);
   };
 
-  const saveComment = (comment: NoteComment) => {
-    if (!comment.thread) return;
+  const saveComment = async (comment: NoteComment) => {
+    const thread = comment.thread;
+    if (!thread) return;
     const body = typeof comment.body === "string" ? comment.body : comment.body.value;
     comment.savedBody = body;
-    comment.thread.comments = comment.thread.comments.map((c) => (c === comment ? Object.assign(comment, { mode: vscode.CommentMode.Preview }) : c));
+    thread.comments = thread.comments.map((c) => (c === comment ? Object.assign(comment, { mode: vscode.CommentMode.Preview, label: "saving…" }) : c));
     keepOpen.add(comment.key);
-    new NoteStore(comment.root).editComment(comment.key, comment.index, body);
-    renderPath(comment.thread.uri.fsPath);
+    await whileSaving(thread, () => git.call("editComment", { root: comment.root, key: comment.key, index: comment.index, body }));
+    renderPath(thread.uri.fsPath);
     syncAfterChange(comment.root);
   };
 
@@ -486,20 +563,20 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // ---- Repo-level commands ----
 
-  const activeRoot = (): RepoInfo | null => {
+  const activeRoot = async (): Promise<RepoInfo | null> => {
     const file = vscode.window.activeTextEditor?.document.uri;
     const folder = vscode.workspace.workspaceFolders?.[0]?.uri;
-    const info = file?.scheme === "file" ? repoFor(file.fsPath) : folder ? repoFor(join(folder.fsPath, "_")) : null;
+    const info = file?.scheme === "file" ? await repoFor(file.fsPath) : folder ? await repoFor(join(folder.fsPath, "_")) : null;
     if (!info) vscode.window.showWarningMessage("Code Notes: open a file inside a git repository first.");
     return info;
   };
 
   const syncNotes = async () => {
-    const info = activeRoot();
+    const info = await activeRoot();
     if (!info) return;
-    new NoteStore(info.root).remote(); // throws with instructions when there is no default remote
+    await git.call("remote", { root: info.root }); // throws with instructions when there is no default remote
     const r = await syncRepo(info.root);
-    vscode.window.showInformationMessage(r ? `Code Notes: ${r.merged} notes merged from the remote${r.pushed ? "; pushed" : ""}.` : "Code Notes: a sync is already running.");
+    vscode.window.showInformationMessage(r ? `Code Notes: ${r.merged} notes merged from the remote${r.pushed ? "; pushed" : ""}.` : "Code Notes: no remote to sync with.");
     renderAll();
   };
 
@@ -513,20 +590,16 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   const importGithub = async () => {
-    const info = activeRoot();
+    const info = await activeRoot();
     if (!info) return;
-    const config = vscode.workspace.getConfiguration("codeNotes");
-    const store = new NoteStore(info.root);
-    const configured = store.git(["config", "--default", "", "--get", "code-notes.github"]).trim();
-    const cache = new Cache(configured || detectRepo(info.root));
-    await githubSession(true);
+    const token = await githubSession(true);
+    const limit = vscode.workspace.getConfiguration("codeNotes").get<number>("importLimit", 300);
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `Code Notes: importing ${cache.repo}` },
+      { location: vscode.ProgressLocation.Notification, title: "Code Notes: importing GitHub review conversations" },
       async (progress) => {
-        await fetchPrsIntoCache(cache, { limit: config.get("importLimit", 300), full: false, log: (m) => { log(m); progress.report({ message: m }); } });
-        const r = importFromCache(store, cache.readPrs());
-        vscode.window.showInformationMessage(
-          `Code Notes: ${r.added} notes added, ${r.updated} updated, ${r.skippedDeleted} skipped because deleted.`);
+        const r = await git.call<{ added: number; updated: number; skippedDeleted: number }>("importGithub", { root: info.root, token, limit },
+          (m) => { log(m); progress.report({ message: m }); });
+        vscode.window.showInformationMessage(`Code Notes: ${r.added} notes added, ${r.updated} updated, ${r.skippedDeleted} skipped because deleted.`);
       });
     renderAll();
     syncAfterChange(info.root);
@@ -538,6 +611,8 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     output,
     controller,
+    git,
+    status,
     decorationsChanged,
     rangeDecoration,
     vscode.window.registerFileDecorationProvider(decorations),
@@ -555,10 +630,9 @@ export function activate(context: vscode.ExtensionContext): void {
     register("codeNotes.syncNotes", "syncing", syncNotes),
     register("codeNotes.importGithub", "importing", importGithub),
     register("codeNotes.refresh", "refreshing", refresh),
-    vscode.window.onDidChangeVisibleTextEditors((editors) => editors.forEach(showRanges)),
+    vscode.window.onDidChangeVisibleTextEditors(visibleChanged),
     // Comment threads move with edits; keep the gutter bars on the same lines.
     vscode.workspace.onDidChangeTextDocument((e) => showRangesFor(e.document)),
-    vscode.workspace.onDidOpenTextDocument(render),
     vscode.workspace.onDidCloseTextDocument(clear),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration("codeNotes")) return;
@@ -571,7 +645,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   // Discover the repos of the workspace folders now (which pulls their notes), not only when a file is opened.
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    if (folder.uri.scheme === "file") repoFor(join(folder.uri.fsPath, "_"));
+    if (folder.uri.scheme === "file") background("finding the repository", repoFor(join(folder.uri.fsPath, "_")));
   }
   renderAll();
 }
@@ -594,6 +668,7 @@ function fillThread(
   note: FileNote,
   range: Located | null,
   githubResolved?: boolean,
+  firstCommentLabel?: string,
 ): void {
   const lastLine = Math.max(doc.lineCount - 1, 0);
   const start = Math.min((range?.start ?? 1) - 1, lastLine);
@@ -609,8 +684,8 @@ function fillThread(
       else if (d.pr) footer.push(`[PR #${d.pr.number}](${d.pr.url}) ${d.pr.title}`);
       if (footer.length) body.appendMarkdown(`\n\n---\n${footer.join("\n\n")}`);
     }
-    return new NoteComment(body, { name: withoutEmail(c.author) }, new Date(c.createdAt), root, note.key, i, c.source === "local",
-      c.editedAt ? "edited" : undefined, c.createdAt);
+    const label = i === 0 && firstCommentLabel ? firstCommentLabel : c.editedAt ? "edited" : undefined;
+    return new NoteComment(body, { name: withoutEmail(c.author) }, new Date(c.createdAt), root, note.key, i, c.source === "local", label, c.createdAt);
   });
   // Only assign what changed: reassigning an identical range can make VS Code redraw the thread collapsed.
   if (!thread.range || thread.range.start.line !== start || thread.range.end.line !== end) {
@@ -618,10 +693,18 @@ function fillThread(
   }
   thread.comments = comments;
   for (const c of comments) c.thread = thread;
-  const heading = d.summary ?? d.comments[0]?.body.split(/\r?\n/)[0].slice(0, 100) ?? "";
+  // The header is a status line (where the note sits, where it comes from, its state), not a preview of the
+  // first comment, which is shown right below it anyway. A summary, when someone wrote one, is added.
   const match = describeMatch(range, d.anchor);
-  const githubState = d.github && githubResolved !== undefined ? ` · ${githubResolved ? "resolved" : "open"} on GitHub` : "";
-  const label = `${describeLines(range)}${match ? ` (${match})` : ""}${note.originalPath ? ` · was ${note.originalPath}` : ""}${githubState}: ${heading}`;
+  const status = [
+    describeLines(range),
+    d.pr ? `PR #${d.pr.number}` : `note by ${withoutEmail(d.comments[0]?.author ?? "unknown")}`,
+    d.github && githubResolved !== undefined ? (githubResolved ? "resolved on GitHub" : "open on GitHub") : null,
+    match || null,
+    note.originalPath ? `was ${note.originalPath}` : null,
+    d.comments.length > 1 ? `${d.comments.length - 1} repl${d.comments.length === 2 ? "y" : "ies"}` : null,
+  ].filter(Boolean).join(" · ");
+  const label = d.summary ? `${status}: ${d.summary}` : status;
   if (thread.label !== label) thread.label = label;
   // The resolve/reopen buttons need the GitHub state; until it is known only "open on GitHub" is offered.
   const contextValue = !d.github ? "codeNote" : githubResolved === undefined ? "codeNote-github" : githubResolved ? "codeNote-github-resolved" : "codeNote-github-open";
