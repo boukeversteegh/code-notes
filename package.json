@@ -1,0 +1,28 @@
+{
+  "name": "code-notes",
+  "version": "1.0.0",
+  "scripts": {
+    "code-notes": "tsx src/cli.ts",
+    "typecheck": "tsc",
+    "test": "node --import tsx --test test/anchor.test.ts test/notes.test.ts"
+  },
+  "license": "ISC",
+  "description": "Surface past GitHub PR review conversations per file",
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "private": true,
+  "bin": {
+    "code-notes": "bin/code-notes.js"
+  },
+  "dependencies": {
+    "diff": "^9.0.0",
+    "tsx": "^4.23.15"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/boukeversteegh/code-notes"
+  }
+}

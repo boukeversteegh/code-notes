@@ -1,0 +1,70 @@
+version: "3"
+
+tasks:
+  install:
+    desc: Install the `code-notes` command and the VS Code extension
+    cmds:
+      - task: install:cli
+      - task: install:vscode
+
+  uninstall:
+    desc: Remove the `code-notes` command and the VS Code extension
+    cmds:
+      - task: uninstall:cli
+      - task: uninstall:vscode
+
+  deps:
+    desc: Install npm dependencies of the CLI
+    sources: [package.json, package-lock.json]
+    cmds:
+      - npm install
+
+  typecheck:
+    desc: Type-check the sources
+    deps: [deps]
+    cmds:
+      - npx tsc
+
+  test:
+    desc: Run the tests
+    deps: [deps]
+    cmds:
+      - npm test
+
+  install:cli:
+    desc: Install `code-notes` as a global command (symlinked, so source edits apply immediately)
+    deps: [typecheck]
+    cmds:
+      - npm link
+      - code-notes --help
+
+  uninstall:cli:
+    desc: Remove the global `code-notes` command
+    cmds:
+      - npm unlink -g code-notes
+
+  deps:vscode:
+    desc: Install npm dependencies of the VS Code extension
+    dir: vscode
+    sources: [package.json, package-lock.json]
+    cmds:
+      - npm install
+
+  package:vscode:
+    desc: Build the VS Code extension into vscode/code-notes.vsix
+    deps: [deps, deps:vscode]
+    dir: vscode
+    cmds:
+      - npx tsc
+      - npm run package
+
+  install:vscode:
+    desc: Build the VS Code extension and install it into VS Code (needs the `code` command on PATH)
+    deps: [package:vscode]
+    cmds:
+      - code --install-extension vscode/code-notes.vsix --force
+
+  uninstall:vscode:
+    desc: Remove the VS Code extension
+    cmds:
+      - code --uninstall-extension boukeversteegh.code-notes

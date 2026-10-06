@@ -1,0 +1,242 @@
+{
+  "name": "code-notes",
+  "displayName": "Code Notes: PR review history",
+  "description": "Shared code notes stored in git notes: past GitHub PR review conversations and notes you write, shown on the lines they belong to.",
+  "version": "0.2.1",
+  "publisher": "boukeversteegh",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "codeNotes.addNote",
+        "title": "Add code note",
+        "category": "Code Notes"
+      },
+      {
+        "command": "codeNotes.createNote",
+        "title": "Save note",
+        "category": "Code Notes"
+      },
+      {
+        "command": "codeNotes.replyNote",
+        "title": "Reply",
+        "category": "Code Notes"
+      },
+      {
+        "command": "codeNotes.deleteNote",
+        "title": "Delete note (no longer relevant)",
+        "category": "Code Notes",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "codeNotes.editComment",
+        "title": "Edit",
+        "category": "Code Notes",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "codeNotes.saveComment",
+        "title": "Save",
+        "category": "Code Notes"
+      },
+      {
+        "command": "codeNotes.cancelEdit",
+        "title": "Cancel",
+        "category": "Code Notes"
+      },
+      {
+        "command": "codeNotes.openOnGithub",
+        "title": "Open conversation on GitHub",
+        "category": "Code Notes",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "codeNotes.resolveOnGithub",
+        "title": "Resolve conversation on GitHub",
+        "category": "Code Notes",
+        "icon": "$(check)"
+      },
+      {
+        "command": "codeNotes.reopenOnGithub",
+        "title": "Reopen conversation on GitHub",
+        "category": "Code Notes",
+        "icon": "$(issue-reopened)"
+      },
+      {
+        "command": "codeNotes.syncNotes",
+        "title": "Sync notes with remote",
+        "category": "Code Notes"
+      },
+      {
+        "command": "codeNotes.importGithub",
+        "title": "Import GitHub review conversations into notes",
+        "category": "Code Notes"
+      },
+      {
+        "command": "codeNotes.refresh",
+        "title": "Reload notes",
+        "category": "Code Notes"
+      }
+    ],
+    "configuration": {
+      "title": "Code Notes",
+      "properties": {
+        "codeNotes.expand": {
+          "type": "string",
+          "enum": [
+            "none",
+            "all"
+          ],
+          "default": "none",
+          "description": "Whether notes open expanded when a file opens. Collapsed notes still show in the gutter and the Comments panel."
+        },
+        "codeNotes.syncOnChange": {
+          "type": "boolean",
+          "default": true,
+          "description": "After adding, replying to or deleting a note, sync notes with the remote set in `git config code-notes.remote`. Without that setting notes stay local."
+        },
+        "codeNotes.syncLimit": {
+          "type": "number",
+          "default": 300,
+          "description": "Maximum number of PRs fetched from GitHub per import."
+        },
+        "codeNotes.pullInterval": {
+          "type": "number",
+          "default": 60,
+          "description": "Seconds between automatic pulls of notes from the remote set in `git config code-notes.remote` (also pulled when the window gains focus). 0 turns periodic pulls off."
+        }
+      }
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codeNotes.addNote",
+          "group": "9_cutcopypaste@99",
+          "when": "resourceScheme == file"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "codeNotes.createNote",
+          "group": "inline",
+          "when": "commentController == code-notes && commentThreadIsEmpty"
+        },
+        {
+          "command": "codeNotes.replyNote",
+          "group": "inline",
+          "when": "commentController == code-notes && !commentThreadIsEmpty"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "codeNotes.openOnGithub",
+          "group": "navigation@1",
+          "when": "commentController == code-notes && commentThread != codeNote"
+        },
+        {
+          "command": "codeNotes.resolveOnGithub",
+          "group": "navigation@2",
+          "when": "commentController == code-notes && commentThread == codeNote-github-open"
+        },
+        {
+          "command": "codeNotes.reopenOnGithub",
+          "group": "navigation@2",
+          "when": "commentController == code-notes && commentThread == codeNote-github-resolved"
+        },
+        {
+          "command": "codeNotes.deleteNote",
+          "group": "navigation@3",
+          "when": "commentController == code-notes && !commentThreadIsEmpty"
+        }
+      ],
+      "comments/comment/title": [
+        {
+          "command": "codeNotes.editComment",
+          "group": "inline@1",
+          "when": "commentController == code-notes && (comment == first-editable || comment == reply-editable)"
+        },
+        {
+          "command": "codeNotes.deleteNote",
+          "group": "inline@2",
+          "when": "commentController == code-notes && (comment == first-editable || comment == first-readonly)"
+        }
+      ],
+      "comments/comment/context": [
+        {
+          "command": "codeNotes.saveComment",
+          "group": "inline@1",
+          "when": "commentController == code-notes && (comment == first-editable || comment == reply-editable)"
+        },
+        {
+          "command": "codeNotes.cancelEdit",
+          "group": "inline@2",
+          "when": "commentController == code-notes && (comment == first-editable || comment == reply-editable)"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "codeNotes.createNote",
+          "when": "false"
+        },
+        {
+          "command": "codeNotes.replyNote",
+          "when": "false"
+        },
+        {
+          "command": "codeNotes.deleteNote",
+          "when": "false"
+        },
+        {
+          "command": "codeNotes.editComment",
+          "when": "false"
+        },
+        {
+          "command": "codeNotes.saveComment",
+          "when": "false"
+        },
+        {
+          "command": "codeNotes.cancelEdit",
+          "when": "false"
+        },
+        {
+          "command": "codeNotes.openOnGithub",
+          "when": "false"
+        },
+        {
+          "command": "codeNotes.resolveOnGithub",
+          "when": "false"
+        },
+        {
+          "command": "codeNotes.reopenOnGithub",
+          "when": "false"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --platform=node --target=node20 --format=cjs --external:vscode --outfile=dist/extension.js",
+    "typecheck": "tsc",
+    "package": "npm run build && vsce package --no-dependencies --skip-license -o code-notes.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "1.90",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/boukeversteegh/code-notes"
+  }
+}
