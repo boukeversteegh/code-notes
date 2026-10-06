@@ -680,12 +680,14 @@ function fillThread(
       const footer: string[] = [];
       const original = originalCode(d, range);
       if (original) footer.push(original);
-      if (d.github) footer.push(`[Open conversation on GitHub](${d.github.url}) · PR #${d.pr?.number} ${d.pr?.title ?? ""}`);
-      else if (d.pr) footer.push(`[PR #${d.pr.number}](${d.pr.url}) ${d.pr.title}`);
       if (footer.length) body.appendMarkdown(`\n\n---\n${footer.join("\n\n")}`);
     }
     const label = i === 0 && firstCommentLabel ? firstCommentLabel : c.editedAt ? "edited" : undefined;
-    return new NoteComment(body, { name: withoutEmail(c.author) }, new Date(c.createdAt), root, note.key, i, c.source === "local", label, c.createdAt);
+    // GitHub comments carry the GitHub username, so their avatar can be shown; local comments only have a git identity.
+    const author: vscode.CommentAuthorInformation = c.source === "github"
+      ? { name: c.author, iconPath: vscode.Uri.parse(`https://avatars.githubusercontent.com/${encodeURIComponent(c.author)}?s=64`) }
+      : { name: withoutEmail(c.author) };
+    return new NoteComment(body, author, new Date(c.createdAt), root, note.key, i, c.source === "local", label, c.createdAt);
   });
   // Only assign what changed: reassigning an identical range can make VS Code redraw the thread collapsed.
   if (!thread.range || thread.range.start.line !== start || thread.range.end.line !== end) {
@@ -698,7 +700,7 @@ function fillThread(
   const match = describeMatch(range, d.anchor);
   const status = [
     describeLines(range),
-    d.pr ? `PR #${d.pr.number}` : `note by ${withoutEmail(d.comments[0]?.author ?? "unknown")}`,
+    d.pr ? `PR #${d.pr.number} ${truncate(d.pr.title, 80)}` : `note by ${withoutEmail(d.comments[0]?.author ?? "unknown")}`,
     d.github && githubResolved !== undefined ? (githubResolved ? "resolved on GitHub" : "open on GitHub") : null,
     match || null,
     note.originalPath ? `was ${note.originalPath}` : null,
@@ -714,6 +716,8 @@ function fillThread(
     if (thread.state !== state) thread.state = state;
   }
 }
+
+const truncate = (text: string, max: number) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
 
 /** A thin vertical bar, stretched to the full line height so consecutive lines form one continuous bar. */
 function gutterBar(color: string): vscode.Uri {
