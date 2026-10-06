@@ -41,6 +41,8 @@ class NoteComment implements vscode.Comment {
     readonly index: number,
     editable: boolean,
     public label?: string,
+    /** createdAt of the stored comment, to identify it when removing. */
+    readonly createdAt?: string,
   ) {
     this.savedBody = typeof body === "string" ? body : body.value;
     // Used by the menus: "first-…" gets the delete button, "…-editable" the edit buttons.
@@ -82,7 +84,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Code Notes");
   const controller = vscode.comments.createCommentController("code-notes", "Code notes");
   const notesCache = new NotesCache();
-  const threadsByDoc = new Map<string, vscode.CommentThread[]>();
+  /** Rendered threads per document, by note key, with a signature of what they show, so re-renders update in place. */
+  const threadsByDoc = new Map<string, Map<string, { thread: vscode.CommentThread; signature: string }>>();
+  const threadsOf = (doc: vscode.TextDocument) => [...(threadsByDoc.get(doc.uri.toString())?.values() ?? [])].map((r) => r.thread);
   const threadInfo = new WeakMap<vscode.CommentThread, ThreadInfo>();
   const repoByDir = new Map<string, RepoInfo | null>();
   const knownRepos: RepoInfo[] = [];
@@ -114,6 +118,7 @@ export function activate(context: vscode.ExtensionContext): void {
         knownRepos.push(info);
         repoByDir.set(dir, info);
         watchNotesRef(info);
+        setTimeout(() => new NoteStore(root).author(), 0); // look up the git identity once, before the first reply
         // Pull right away, so a fresh clone shows the shared notes without waiting for the next periodic pull.
         // The ref watcher re-renders when the pull brings notes.
         setTimeout(() => syncRepo(root).catch((err) => log(`pull ${root} failed: ${(err as Error).message}`)), 0);
@@ -130,9 +135,16 @@ export function activate(context: vscode.ExtensionContext): void {
     const notesDir = join(info.commonDir, "refs", "notes");
     mkdirSync(notesDir, { recursive: true });
     let timer: NodeJS.Timeout | undefined;
+    let lastHead = new NoteStore(info.root).head();
     const changed = () => {
       clearTimeout(timer);
-      timer = setTimeout(renderAll, 300);
+      timer = setTimeout(() => {
+        // Lock files and rewrites of the same value also trigger the watcher; only a new notes commit matters.
+        const head = new NoteStore(info.root).head();
+        if (head === lastHead) return;
+        lastHead = head;
+        renderAll();
+      }, 300);
     };
     const watchers = [watch(notesDir, changed)];
     if (existsSync(join(info.commonDir, "packed-refs"))) watchers.push(watch(join(info.commonDir, "packed-refs"), changed));
@@ -154,7 +166,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   const showRanges = (editor: vscode.TextEditor) => {
-    const ranges = (threadsByDoc.get(editor.document.uri.toString()) ?? []).flatMap((t) => (t.range ? [t.range] : []));
+    const ranges = threadsOf(editor.document).flatMap((t) => (t.range ? [t.range] : []));
     editor.setDecorations(rangeDecoration, ranges);
   };
 
@@ -162,27 +174,43 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.visibleTextEditors.filter((e) => e.document === doc).forEach(showRanges);
 
   const clear = (doc: vscode.TextDocument) => {
-    threadsByDoc.get(doc.uri.toString())?.forEach((t) => t.dispose());
+    threadsOf(doc).forEach((t) => t.dispose());
     threadsByDoc.delete(doc.uri.toString());
   };
 
+  /**
+   * Shows the notes of a document. Threads are matched to notes by key: unchanged notes keep their thread
+   * untouched (so an open note stays open), changed notes are updated in place, and only new or removed
+   * notes create or dispose threads.
+   */
   const render = (doc: vscode.TextDocument) => {
-    clear(doc);
-    if (doc.uri.scheme === "file") {
-      const found = notesFor(doc.uri.fsPath);
-      if (found && found.notes.length > 0) {
-        const lines = doc.getText().split(/\r?\n/);
-        const placed = placeNotes(found.info.root, found.notes.map((n) => n.doc), lines);
-        const expand = vscode.workspace.getConfiguration("codeNotes").get<"none" | "all">("expand", "none");
-        threadsByDoc.set(doc.uri.toString(), found.notes.map((note, i) => {
-          const resolved = note.doc.github ? new ThreadStates(found.info.root).get(note.doc.github.threadId) : undefined;
-          const thread = createThread(controller, doc, found.info.root, note, placed[i], expand, resolved);
-          threadInfo.set(thread, { root: found.info.root, key: note.key, doc: note.doc });
-          return thread;
-        }));
-        refreshGithubStates(found.info.root, found.notes, doc.uri.fsPath);
-      }
+    const uri = doc.uri.toString();
+    const previous = threadsByDoc.get(uri) ?? new Map<string, { thread: vscode.CommentThread; signature: string }>();
+    const next = new Map<string, { thread: vscode.CommentThread; signature: string }>();
+    const found = doc.uri.scheme === "file" ? notesFor(doc.uri.fsPath) : null;
+    if (found && found.notes.length > 0) {
+      const lines = doc.getText().split(/\r?\n/);
+      const placed = placeNotes(found.info.root, found.notes.map((n) => n.doc), lines);
+      const expand = vscode.workspace.getConfiguration("codeNotes").get<"none" | "all">("expand", "none");
+      const states = new ThreadStates(found.info.root);
+      found.notes.forEach((note, i) => {
+        const resolved = note.doc.github ? states.get(note.doc.github.threadId) : undefined;
+        const signature = JSON.stringify([note.doc, placed[i], resolved, note.originalPath]);
+        const old = previous.get(note.key);
+        if (old?.signature === signature) {
+          next.set(note.key, old);
+          return;
+        }
+        const thread = old?.thread ?? createThread(controller, doc, expand);
+        fillThread(thread, doc, found.info.root, note, placed[i], resolved);
+        threadInfo.set(thread, { root: found.info.root, key: note.key, doc: note.doc });
+        next.set(note.key, { thread, signature });
+      });
+      refreshGithubStates(found.info.root, found.notes, doc.uri.fsPath);
     }
+    for (const [key, r] of previous) if (!next.has(key)) r.thread.dispose();
+    if (next.size) threadsByDoc.set(uri, next);
+    else threadsByDoc.delete(uri);
     showRangesFor(doc);
   };
 
@@ -337,9 +365,12 @@ export function activate(context: vscode.ExtensionContext): void {
     // Show the note right away; writing it to git notes and syncing follow in the background.
     reply.thread.dispose();
     const range = anchor.endLine ? { start: anchor.startLine!, end: anchor.endLine, match: "exact" as const } : null;
-    const shown = createThread(controller, doc, info.root, { key, doc: note, originalPath: null }, range, "all");
+    const shown = createThread(controller, doc, "all");
+    fillThread(shown, doc, info.root, { key, doc: note, originalPath: null }, range);
     threadInfo.set(shown, { root: info.root, key, doc: note });
-    threadsByDoc.set(doc.uri.toString(), [...(threadsByDoc.get(doc.uri.toString()) ?? []), shown]);
+    const rendered = threadsByDoc.get(doc.uri.toString()) ?? new Map();
+    rendered.set(key, { thread: shown, signature: "" });
+    threadsByDoc.set(doc.uri.toString(), rendered);
     showRangesFor(doc);
     setTimeout(guarded("saving the note", () => {
       store.put(key, `code-notes: add note on ${path}`, () => note);
@@ -364,11 +395,30 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!t) return;
     const store = new NoteStore(t.root);
     const author = store.author();
-    // Show the reply right away; the write and the sync follow.
-    reply.thread.comments = [...reply.thread.comments, new NoteComment(reply.text, { name: withoutEmail(author) }, new Date(), t.root, t.key, reply.thread.comments.length, true)];
-    store.addComment(t.key, { author, body: reply.text, createdAt: new Date().toISOString() });
-    renderPath(reply.thread.uri.fsPath);
-    syncAfterChange(t.root);
+    const createdAt = new Date().toISOString();
+    // Show the reply right away and return, so the reply box clears; writing and syncing follow in the background.
+    const shown = new NoteComment(reply.text, { name: withoutEmail(author) }, new Date(createdAt), t.root, t.key, reply.thread.comments.length, true, undefined, createdAt);
+    shown.thread = reply.thread;
+    reply.thread.comments = [...reply.thread.comments, shown];
+    setTimeout(guarded("saving the reply", () => {
+      store.addComment(t.key, { author, body: reply.text, createdAt });
+      renderPath(reply.thread.uri.fsPath);
+      syncAfterChange(t.root);
+    }), 0);
+  };
+
+  /** Removes one of your own replies from a note. */
+  const deleteComment = (comment: NoteComment) => {
+    const thread = comment.thread;
+    if (!thread || !comment.createdAt) return;
+    thread.comments = thread.comments.filter((c) => c !== comment); // remove it from view right away
+    setTimeout(guarded("removing the reply", () => {
+      if (!new NoteStore(comment.root).removeComment(comment.key, comment.index, comment.createdAt!)) {
+        throw new Error("the reply changed in the meantime; refresh and try again");
+      }
+      renderPath(thread.uri.fsPath);
+      syncAfterChange(comment.root);
+    }), 0);
   };
 
   /** Deletes a note; invoked from the thread header or from its first comment. */
@@ -381,6 +431,7 @@ export function activate(context: vscode.ExtensionContext): void {
     if (reason === undefined) return;
     const fsPath = thread.uri.fsPath;
     thread.dispose(); // remove it from view right away
+    threadsByDoc.get(thread.uri.toString())?.delete(t.key);
     const store = new NoteStore(t.root);
     const justification = reason || "deleted in VS Code";
     store.softDelete(t.key, store.author(), justification);
@@ -445,6 +496,15 @@ export function activate(context: vscode.ExtensionContext): void {
     renderAll();
   };
 
+  /** Syncs the notes of every known repository with its remote (pull and push), then re-renders. */
+  const refresh = async () => {
+    const repos = [...new Map(knownRepos.map((r) => [r.commonDir, r])).values()];
+    const results = await Promise.all(repos.map((r) => syncRepo(r.root)));
+    const merged = results.reduce((n, r) => n + (r?.merged ?? 0), 0);
+    renderAll();
+    vscode.window.setStatusBarMessage(`Code Notes: synced${merged ? `, ${merged} notes merged` : ""}`, 3000);
+  };
+
   const importGithub = async () => {
     const info = activeRoot();
     if (!info) return;
@@ -477,6 +537,7 @@ export function activate(context: vscode.ExtensionContext): void {
     register("codeNotes.createNote", "saving the note", createNote),
     register("codeNotes.addNote", "adding a note", addNoteOnSelection),
     register("codeNotes.replyNote", "replying", replyNote),
+    register("codeNotes.deleteComment", "removing the reply", deleteComment),
     register("codeNotes.deleteNote", "deleting the note", deleteNote),
     register("codeNotes.editComment", "editing", editComment),
     register("codeNotes.saveComment", "saving the edit", saveComment),
@@ -486,7 +547,7 @@ export function activate(context: vscode.ExtensionContext): void {
     register("codeNotes.openOnGithub", "opening GitHub", openOnGithub),
     register("codeNotes.syncNotes", "syncing", syncNotes),
     register("codeNotes.importGithub", "importing", importGithub),
-    register("codeNotes.refresh", "reloading", renderAll),
+    register("codeNotes.refresh", "refreshing", refresh),
     vscode.window.onDidChangeVisibleTextEditors((editors) => editors.forEach(showRanges)),
     // Comment threads move with edits; keep the gutter bars on the same lines.
     vscode.workspace.onDidChangeTextDocument((e) => showRangesFor(e.document)),
@@ -508,15 +569,25 @@ export function activate(context: vscode.ExtensionContext): void {
   renderAll();
 }
 
-function createThread(
-  controller: vscode.CommentController,
+/** A new, empty note thread; fillThread() sets its content. Only new threads get the initial collapsed state. */
+function createThread(controller: vscode.CommentController, doc: vscode.TextDocument, expand: "none" | "all"): vscode.CommentThread {
+  const thread = controller.createCommentThread(doc.uri, new vscode.Range(0, 0, 0, 0), []);
+  thread.canReply = true;
+  thread.collapsibleState = expand === "all"
+    ? vscode.CommentThreadCollapsibleState.Expanded
+    : vscode.CommentThreadCollapsibleState.Collapsed;
+  return thread;
+}
+
+/** Sets what a thread shows for a note; also used to update a thread in place without closing it. */
+function fillThread(
+  thread: vscode.CommentThread,
   doc: vscode.TextDocument,
   root: string,
   note: FileNote,
   range: Located | null,
-  expand: "none" | "all",
   githubResolved?: boolean,
-): vscode.CommentThread {
+): void {
   const lastLine = Math.max(doc.lineCount - 1, 0);
   const start = Math.min((range?.start ?? 1) - 1, lastLine);
   const end = Math.min((range?.end ?? 1) - 1, lastLine);
@@ -532,11 +603,11 @@ function createThread(
       if (footer.length) body.appendMarkdown(`\n\n---\n${footer.join("\n\n")}`);
     }
     return new NoteComment(body, { name: withoutEmail(c.author) }, new Date(c.createdAt), root, note.key, i, c.source === "local",
-      c.editedAt ? "edited" : undefined);
+      c.editedAt ? "edited" : undefined, c.createdAt);
   });
-  const thread = controller.createCommentThread(doc.uri, new vscode.Range(start, 0, end, doc.lineAt(end).text.length), comments);
+  thread.range = new vscode.Range(start, 0, end, doc.lineAt(end).text.length);
+  thread.comments = comments;
   for (const c of comments) c.thread = thread;
-  thread.canReply = true;
   const heading = d.summary ?? d.comments[0]?.body.split(/\r?\n/)[0].slice(0, 100) ?? "";
   const match = describeMatch(range, d.anchor);
   const githubState = d.github && githubResolved !== undefined ? ` · ${githubResolved ? "resolved" : "open"} on GitHub` : "";
@@ -544,10 +615,6 @@ function createThread(
   // The resolve/reopen buttons need the GitHub state; until it is known only "open on GitHub" is offered.
   thread.contextValue = !d.github ? "codeNote" : githubResolved === undefined ? "codeNote-github" : githubResolved ? "codeNote-github-resolved" : "codeNote-github-open";
   if (d.github && githubResolved !== undefined) thread.state = githubResolved ? vscode.CommentThreadState.Resolved : vscode.CommentThreadState.Unresolved;
-  thread.collapsibleState = expand === "all"
-    ? vscode.CommentThreadCollapsibleState.Expanded
-    : vscode.CommentThreadCollapsibleState.Collapsed;
-  return thread;
 }
 
 /** A thin vertical bar, stretched to the full line height so consecutive lines form one continuous bar. */

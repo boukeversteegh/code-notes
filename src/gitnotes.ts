@@ -259,6 +259,19 @@ export class NoteStore {
   }
 
   /** Replaces the body of a locally written comment. GitHub comments are owned by GitHub and not editable here. */
+  /**
+   * Removes one locally written reply. `createdAt` must match, so a reply is never removed by a stale index
+   * after the comments changed. The first comment is the note itself: delete the note instead.
+   */
+  removeComment(key: string, index: number, createdAt: string): NoteDoc | null {
+    const now = new Date().toISOString();
+    return this.put(key, `code-notes: remove comment from ${key}`, (doc) => {
+      const c = doc?.comments[index];
+      if (!doc || index === 0 || !c || c.source !== "local" || c.createdAt !== createdAt) return null;
+      return { ...doc, comments: doc.comments.filter((_, i) => i !== index), updatedAt: now };
+    });
+  }
+
   editComment(key: string, index: number, body: string): NoteDoc | null {
     const now = new Date().toISOString();
     return this.put(key, `code-notes: edit comment on ${key}`, (doc) => {
@@ -299,6 +312,7 @@ export class NoteStore {
   /** Merges the notes of `theirs` into the local ref. Only notes whose blobs differ are read. */
   private mergeFrom(theirs: string, remote: string): number {
     const ours = this.head();
+    if (ours === theirs) return 0;
     if (!ours || this.isAncestor(ours, theirs)) {
       this.git(["update-ref", "-m", "code-notes: fast-forward", this.ref, theirs, ours ?? ZERO]);
       return 0;
@@ -326,22 +340,36 @@ export class NoteStore {
     return merged;
   }
 
-  /** Fetches the remote's notes and merges them per note into the local notes. */
-  pull(remote = this.remote()): { fetched: boolean; merged: number } {
+  /** Commit of the notes ref on the remote, from `git ls-remote` output; null when the remote has no notes. */
+  private static remoteHead(lsRemote: string): string | null {
+    return lsRemote.trim().split(/\s+/)[0] || null;
+  }
+
+  /**
+   * Fetch arguments for the notes ref. Negotiation uses only the previously fetched notes commit; by default
+   * git offers every local ref, which is slow in clones with many refs (such as fetched PR branches).
+   */
+  private fetchArgs(remote: string, tracking: string): string[] {
+    const tip = this.head(tracking);
+    return ["fetch", "-q", ...(tip ? [`--negotiation-tip=${tracking}`] : []), remote, `+${this.ref}:${tracking}`];
+  }
+
+  /** Fetches the remote's notes and merges them per note into the local notes. Skips the fetch when nothing is new. */
+  pull(remote = this.remote()): { fetched: boolean; merged: number; remoteHead: string | null } {
     const tracking = `refs/code-notes-remotes/${remote}`;
-    const exists = this.git(["ls-remote", remote, this.ref]).trim() !== "";
-    if (!exists) return { fetched: false, merged: 0 };
-    this.git(["fetch", "-q", remote, `+${this.ref}:${tracking}`]);
-    const theirs = this.head(tracking);
-    return { fetched: true, merged: theirs ? this.mergeFrom(theirs, remote) : 0 };
+    const theirs = NoteStore.remoteHead(this.git(["ls-remote", remote, this.ref]));
+    if (!theirs) return { fetched: false, merged: 0, remoteHead: null };
+    if (this.head(tracking) !== theirs) this.git(this.fetchArgs(remote, tracking));
+    return { fetched: true, merged: this.mergeFrom(theirs, remote), remoteHead: theirs };
   }
 
   /**
    * Pushes the local notes. A push is never forced: when the remote has notes that are not here yet,
    * it is rejected and a pull (or sync) has to merge them first.
    */
-  push(remote = this.remote()): "pushed" | "rejected" | "nothing" {
-    if (!this.head()) return "nothing";
+  push(remote = this.remote(), remoteHead?: string | null): "pushed" | "rejected" | "nothing" {
+    const head = this.head();
+    if (!head || head === remoteHead) return "nothing"; // the remote already has these notes
     const r = spawnSync("git", ["push", "-q", remote, `${this.ref}:${this.ref}`], { cwd: this.root, encoding: "utf8" });
     if (r.status === 0) return "pushed";
     if (/rejected|non-fast-forward|fetch first/i.test(r.stderr)) return "rejected";
@@ -351,8 +379,8 @@ export class NoteStore {
   /** Pull, then push; repeats when someone pushed in between. */
   sync(remote = this.remote()): { fetched: boolean; merged: number; pushed: boolean } {
     for (let attempt = 0; attempt < 3; attempt++) {
-      const { fetched, merged } = this.pull(remote);
-      const pushed = this.push(remote);
+      const { fetched, merged, remoteHead } = this.pull(remote);
+      const pushed = this.push(remote, remoteHead);
       if (pushed !== "rejected") return { fetched, merged, pushed: pushed === "pushed" };
     }
     throw new Error(`Could not push ${this.ref} to ${remote}.`);
@@ -362,9 +390,12 @@ export class NoteStore {
   async syncAsync(remote = this.remote()): Promise<{ fetched: boolean; merged: number; pushed: boolean }> {
     const tracking = `refs/code-notes-remotes/${remote}`;
     for (let attempt = 0; attempt < 3; attempt++) {
-      const exists = (await this.gitAsync(["ls-remote", remote, this.ref])).stdout.trim() !== "";
-      if (exists && !(await this.gitAsync(["fetch", "-q", remote, `+${this.ref}:${tracking}`])).ok) throw new Error(`Could not fetch notes from ${remote}.`);
-      const theirs = exists ? this.head(tracking) : null;
+      const theirs = NoteStore.remoteHead((await this.gitAsync(["ls-remote", remote, this.ref])).stdout);
+      const exists = theirs !== null;
+      // Only fetch when the remote has a notes commit that is not here yet.
+      if (theirs && this.head(tracking) !== theirs && !(await this.gitAsync(this.fetchArgs(remote, tracking))).ok) {
+        throw new Error(`Could not fetch notes from ${remote}.`);
+      }
       const merged = theirs ? this.mergeFrom(theirs, remote) : 0;
       if (!this.head()) return { fetched: exists, merged, pushed: false };
       // Skip the push when the remote already has our notes.

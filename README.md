@@ -53,7 +53,7 @@ git fetch https://github.com/<owner>/<repo>.git '+refs/pull/*/head:refs/code-not
 - Imported notes link to their GitHub conversation, show whether it is open or resolved on GitHub, and can resolve or reopen it. Deleting a note whose conversation is still open posts your reason on GitHub and resolves the conversation; a note from a resolved conversation is only removed locally.
 - Whether a conversation is resolved is not stored in the notes: a note either exists or is deleted. The state is looked up on GitHub when a note is shown and cached for five minutes in `<git-common-dir>/code-notes/github-thread-states.json`, shared by the CLI, the extension and all worktrees.
 - Changes are synced right away (`codeNotes.syncOnChange`), and notes from other clones are pulled when the window gains focus and every `codeNotes.pullInterval` seconds (default 60).
-- Commands: **Code Notes: Sync notes with remote**, **Import GitHub review conversations into notes**, **Reload notes**. `codeNotes.importLimit` caps the number of PRs fetched per import.
+- Commands: **Code Notes: Refresh notes** (sync with the remote and redraw; also the refresh icon in the Comments panel), **Sync notes with remote**, **Import GitHub review conversations into notes**. `codeNotes.importLimit` caps the number of PRs fetched per import.
 
 ## Troubleshooting
 

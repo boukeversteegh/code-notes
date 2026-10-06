@@ -2,7 +2,7 @@
   "name": "code-notes",
   "displayName": "Code Notes: PR review history",
   "description": "Shared code notes stored in git notes: past GitHub PR review conversations and notes you write, shown on the lines they belong to.",
-  "version": "0.3.2",
+  "version": "0.3.4",
   "publisher": "boukeversteegh",
   "private": true,
   "engines": {
@@ -84,8 +84,15 @@
       },
       {
         "command": "codeNotes.refresh",
-        "title": "Reload notes",
-        "category": "Code Notes"
+        "title": "Refresh notes (sync with remote)",
+        "category": "Code Notes",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "codeNotes.deleteComment",
+        "title": "Delete reply",
+        "category": "Code Notes",
+        "icon": "$(trash)"
       }
     ],
     "configuration": {
@@ -169,6 +176,11 @@
           "command": "codeNotes.deleteNote",
           "group": "inline@2",
           "when": "commentController == code-notes && (comment == first-editable || comment == first-readonly)"
+        },
+        {
+          "command": "codeNotes.deleteComment",
+          "group": "inline@3",
+          "when": "commentController == code-notes && comment == reply-editable"
         }
       ],
       "comments/comment/context": [
@@ -219,6 +231,17 @@
         {
           "command": "codeNotes.reopenOnGithub",
           "when": "false"
+        },
+        {
+          "command": "codeNotes.deleteComment",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "codeNotes.refresh",
+          "group": "navigation",
+          "when": "view == workbench.panel.comments"
         }
       ]
     }
