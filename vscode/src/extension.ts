@@ -270,11 +270,7 @@ export function activate(context: vscode.ExtensionContext): void {
   /** Background sync of one repo; the network steps do not block the extension host. */
   const syncRepo = async (root: string): Promise<{ fetched: boolean; merged: number; pushed: boolean } | null> => {
     const store = new NoteStore(root);
-    try {
-      store.configuredRemote();
-    } catch {
-      return null; // no remote configured: notes stay local
-    }
+    if (!store.defaultRemote()) return null; // no remote: notes stay local
     const running = syncing.get(root);
     if (running) {
       if (queued.has(root)) return running;
@@ -440,7 +436,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const syncNotes = async () => {
     const info = activeRoot();
     if (!info) return;
-    new NoteStore(info.root).configuredRemote(); // throws with setup instructions when missing
+    new NoteStore(info.root).remote(); // throws with instructions when there is no default remote
     const r = await syncRepo(info.root);
     vscode.window.showInformationMessage(r ? `Code Notes: ${r.merged} notes merged from the remote${r.pushed ? "; pushed" : ""}.` : "Code Notes: a sync is already running.");
     renderAll();

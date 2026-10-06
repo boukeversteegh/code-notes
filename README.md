@@ -38,7 +38,7 @@ code-notes import [--limit N] [--no-fetch]         # fetch conversations from Gi
 
 `import` can be re-run at any time: it fetches the PRs updated since the last run, so new comments are added to existing notes and new conversations become new notes. Conversations whose note was deleted are skipped. Imported notes are then shared like any other note with `push` or `sync`.
 
-Sharing notes needs a remote for them: `git config code-notes.remote <remote>`. Without it, notes stay local, so they are never pushed anywhere by accident. The GitHub repository for `import` comes from `--repo owner/name`, `git config code-notes.github owner/name`, or the `origin` remote; the GitHub token from `GITHUB_TOKEN`/`GH_TOKEN` or `gh auth token`.
+Notes are pulled from and pushed to the repository's default remote: the remote of the current branch, else `origin`, else the only remote. `git config code-notes.remote <remote>` overrides it. A repository without a remote keeps its notes local. The GitHub repository for `import` comes from `--repo owner/name`, `git config code-notes.github owner/name`, or the `origin` remote; the GitHub token from `GITHUB_TOKEN`/`GH_TOKEN` or `gh auth token`.
 
 To follow imported notes through history exactly (see "Placing notes"), fetch the PR branches once:
 

@@ -38,7 +38,8 @@ comment    Append a comment to a note.
 delete     Soft-delete a note: it disappears everywhere after the next sync and an import never brings it back.
            With --resolve-on-github, the reason is also posted on the note's open GitHub conversation and it is resolved.
 restore    Undo a delete.
-pull       Fetch the notes of the remote set in \`git config code-notes.remote\` (or --remote) and merge them.
+pull       Fetch the notes of the repo's default remote and merge them: --remote, else \`git config code-notes.remote\`,
+           else the remote of the current branch, else origin, else the only remote.
 push       Push the local notes to that remote. Rejected when the remote has notes that are not here yet.
 sync       Pull, then push.
 import     Fetch review conversations of closed and merged PRs from GitHub and write them into notes. Deciding

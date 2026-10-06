@@ -20,7 +20,6 @@ const fileLines = Array.from({ length: 10 }, (_, i) => `line ${i + 1}`);
 function configure(dir: string, name: string) {
   git(dir, "config", "user.name", name);
   git(dir, "config", "user.email", `${name}@example.com`);
-  git(dir, "config", "code-notes.remote", "origin");
 }
 
 function manualNote(store: NoteStore, path: string, start: number, end: number, body: string): string {
@@ -145,4 +144,14 @@ test("notes follow renamed files and moved lines", () => {
 test("locate keeps the stored range when the anchored text is unchanged", () => {
   assert.deepEqual(locate({ commit: null, startLine: 2, endLine: 3, text: "c" }, ["a", "b", "c"]), { start: 2, end: 3, match: "exact" });
   assert.deepEqual(locate({ commit: null, startLine: 2, endLine: 3, text: "c" }, ["x", "a", "b", "c"]), { start: 3, end: 4, match: "offset" });
+});
+
+test("notes use the repository's default remote unless overridden", () => {
+  assert.equal(new NoteStore(seed).defaultRemote(), null, "a repo without remotes keeps notes local");
+  assert.equal(new NoteStore(b).defaultRemote(), "origin", "a clone uses the remote of its branch");
+  git(b, "remote", "add", "mirror", remote);
+  git(b, "config", "code-notes.remote", "mirror");
+  assert.equal(new NoteStore(b).defaultRemote(), "mirror", "git config code-notes.remote overrides it");
+  git(b, "config", "--unset", "code-notes.remote");
+  git(b, "remote", "remove", "mirror");
 });

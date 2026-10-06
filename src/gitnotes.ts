@@ -269,13 +269,30 @@ export class NoteStore {
     });
   }
 
-  /** Remote configured for note sync. Deliberately not defaulted to origin, so notes are never pushed by accident. */
-  configuredRemote(): string {
-    const r = spawnSync("git", ["config", "--get", "code-notes.remote"], { cwd: this.root, encoding: "utf8" });
-    const remote = r.stdout.trim();
-    if (r.status !== 0 || !remote) {
-      throw new Error("No remote configured for code notes. Set one with: git config code-notes.remote <remote-name>");
-    }
+  /**
+   * The remote notes are pulled from and pushed to: `git config code-notes.remote` when set, otherwise the
+   * remote the current branch tracks, otherwise `origin`, otherwise the only remote. Null when the repo has
+   * no remote (notes then stay local) or several remotes and none of them is the default.
+   */
+  defaultRemote(): string | null {
+    const get = (...args: string[]) => {
+      const r = spawnSync("git", args, { cwd: this.root, encoding: "utf8" });
+      return r.status === 0 ? r.stdout.trim() : "";
+    };
+    const override = get("config", "--get", "code-notes.remote");
+    if (override) return override;
+    const branch = get("symbolic-ref", "--short", "-q", "HEAD");
+    const tracked = branch ? get("config", "--get", `branch.${branch}.remote`) : "";
+    if (tracked && tracked !== ".") return tracked;
+    const remotes = get("remote").split(/\r?\n/).filter(Boolean);
+    if (remotes.includes("origin")) return "origin";
+    return remotes.length === 1 ? remotes[0] : null;
+  }
+
+  /** defaultRemote(), or an error explaining how to choose one. */
+  remote(): string {
+    const remote = this.defaultRemote();
+    if (!remote) throw new Error("This repository has no default remote for code notes. Choose one with: git config code-notes.remote <remote-name>");
     return remote;
   }
 
@@ -310,7 +327,7 @@ export class NoteStore {
   }
 
   /** Fetches the remote's notes and merges them per note into the local notes. */
-  pull(remote = this.configuredRemote()): { fetched: boolean; merged: number } {
+  pull(remote = this.remote()): { fetched: boolean; merged: number } {
     const tracking = `refs/code-notes-remotes/${remote}`;
     const exists = this.git(["ls-remote", remote, this.ref]).trim() !== "";
     if (!exists) return { fetched: false, merged: 0 };
@@ -323,7 +340,7 @@ export class NoteStore {
    * Pushes the local notes. A push is never forced: when the remote has notes that are not here yet,
    * it is rejected and a pull (or sync) has to merge them first.
    */
-  push(remote = this.configuredRemote()): "pushed" | "rejected" | "nothing" {
+  push(remote = this.remote()): "pushed" | "rejected" | "nothing" {
     if (!this.head()) return "nothing";
     const r = spawnSync("git", ["push", "-q", remote, `${this.ref}:${this.ref}`], { cwd: this.root, encoding: "utf8" });
     if (r.status === 0) return "pushed";
@@ -332,7 +349,7 @@ export class NoteStore {
   }
 
   /** Pull, then push; repeats when someone pushed in between. */
-  sync(remote = this.configuredRemote()): { fetched: boolean; merged: number; pushed: boolean } {
+  sync(remote = this.remote()): { fetched: boolean; merged: number; pushed: boolean } {
     for (let attempt = 0; attempt < 3; attempt++) {
       const { fetched, merged } = this.pull(remote);
       const pushed = this.push(remote);
@@ -342,7 +359,7 @@ export class NoteStore {
   }
 
   /** Like sync(), but the network steps (ls-remote, fetch, push) do not block the calling thread. */
-  async syncAsync(remote = this.configuredRemote()): Promise<{ fetched: boolean; merged: number; pushed: boolean }> {
+  async syncAsync(remote = this.remote()): Promise<{ fetched: boolean; merged: number; pushed: boolean }> {
     const tracking = `refs/code-notes-remotes/${remote}`;
     for (let attempt = 0; attempt < 3; attempt++) {
       const exists = (await this.gitAsync(["ls-remote", remote, this.ref])).stdout.trim() !== "";
