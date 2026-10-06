@@ -51,12 +51,15 @@ export function originalCode(doc: NoteDoc, located: Located | null): string | nu
 }
 
 /** Markdown for one note. `range` is where the note sits in the current file, if known. */
-export function formatNote(n: FileNote, range: Located | null): string {
+export function formatNote(n: FileNote, range: Located | null, githubResolved?: boolean): string {
   const { doc } = n;
   const origin = doc.pr ? `PR #${doc.pr.number} ${doc.pr.title}` : `note by ${withoutEmail(doc.comments[0]?.author ?? "unknown")}`;
   const match = describeMatch(range, doc.anchor);
   const out = [`### ${describeLines(range)}${match ? ` (${match})` : ""} · ${origin}`, `key: \`${n.key}\``];
-  if (doc.pr) out.push(doc.comments[0]?.url ?? doc.pr.url);
+  if (doc.pr) {
+    const status = githubResolved === undefined ? "" : githubResolved ? " (resolved on GitHub)" : " (open on GitHub)";
+    out.push(`${doc.github?.url ?? doc.comments[0]?.url ?? doc.pr.url}${status}`);
+  }
   if (n.originalPath) out.push(`(written when the file was ${n.originalPath})`);
   if (doc.summary) out.push(`> ${doc.summary}`);
   const original = originalCode(doc, range);
@@ -67,8 +70,8 @@ export function formatNote(n: FileNote, range: Located | null): string {
   return out.join("\n");
 }
 
-export function formatFileNotes(path: string, notes: { note: FileNote; range: Located | null }[]): string {
+export function formatFileNotes(path: string, notes: { note: FileNote; range: Located | null; githubResolved?: boolean }[]): string {
   if (notes.length === 0) return `No code notes for ${path}.`;
   const header = `## Code notes for ${path} (${notes.length})\nNotes that are no longer relevant can be removed with \`code-notes delete <key> --reason "..."\`.`;
-  return [header, ...notes.map(({ note, range }) => formatNote(note, range))].join("\n\n");
+  return [header, ...notes.map(({ note, range, githubResolved }) => formatNote(note, range, githubResolved))].join("\n\n");
 }

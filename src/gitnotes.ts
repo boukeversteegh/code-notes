@@ -38,8 +38,8 @@ export interface NoteDoc {
   summary: string | null;
   comments: NoteComment[];
   pr: { number: number; title: string; url: string; state: string } | null;
-  /** The GitHub review thread an imported note comes from, with its last known resolution state. */
-  github?: { threadId: string; url: string; isResolved: boolean; checkedAt: string };
+  /** The GitHub review thread an imported note comes from. Whether it is resolved is looked up on GitHub, not stored. */
+  github?: { threadId: string; url: string };
   createdAt: string;
   /** Last change to the content (everything except the deletion state). */
   updatedAt: string;
@@ -269,15 +269,6 @@ export class NoteStore {
     });
   }
 
-  /** Records the GitHub resolution state of an imported note's thread. */
-  setGithubResolved(key: string, isResolved: boolean): NoteDoc | null {
-    const now = new Date().toISOString();
-    return this.put(key, `code-notes: thread ${isResolved ? "resolved" : "reopened"} on GitHub`, (doc) =>
-      doc?.github && doc.github.isResolved !== isResolved
-        ? { ...doc, github: { ...doc.github, isResolved, checkedAt: now }, updatedAt: now }
-        : null);
-  }
-
   /** Remote configured for note sync. Deliberately not defaulted to origin, so notes are never pushed by accident. */
   configuredRemote(): string {
     const r = spawnSync("git", ["config", "--get", "code-notes.remote"], { cwd: this.root, encoding: "utf8" });
@@ -318,21 +309,34 @@ export class NoteStore {
     return merged;
   }
 
-  /**
-   * Fetches the remote's notes, merges them per note into the local notes, and pushes the result.
-   * Returns what happened, for logging.
-   */
-  sync(remote = this.configuredRemote()): { fetched: boolean; merged: number; pushed: boolean } {
+  /** Fetches the remote's notes and merges them per note into the local notes. */
+  pull(remote = this.configuredRemote()): { fetched: boolean; merged: number } {
     const tracking = `refs/code-notes-remotes/${remote}`;
+    const exists = this.git(["ls-remote", remote, this.ref]).trim() !== "";
+    if (!exists) return { fetched: false, merged: 0 };
+    this.git(["fetch", "-q", remote, `+${this.ref}:${tracking}`]);
+    const theirs = this.head(tracking);
+    return { fetched: true, merged: theirs ? this.mergeFrom(theirs, remote) : 0 };
+  }
+
+  /**
+   * Pushes the local notes. A push is never forced: when the remote has notes that are not here yet,
+   * it is rejected and a pull (or sync) has to merge them first.
+   */
+  push(remote = this.configuredRemote()): "pushed" | "rejected" | "nothing" {
+    if (!this.head()) return "nothing";
+    const r = spawnSync("git", ["push", "-q", remote, `${this.ref}:${this.ref}`], { cwd: this.root, encoding: "utf8" });
+    if (r.status === 0) return "pushed";
+    if (/rejected|non-fast-forward|fetch first/i.test(r.stderr)) return "rejected";
+    throw new Error(`Could not push ${this.ref} to ${remote}: ${r.stderr.trim()}`);
+  }
+
+  /** Pull, then push; repeats when someone pushed in between. */
+  sync(remote = this.configuredRemote()): { fetched: boolean; merged: number; pushed: boolean } {
     for (let attempt = 0; attempt < 3; attempt++) {
-      const exists = this.git(["ls-remote", remote, this.ref]).trim() !== "";
-      if (exists) this.git(["fetch", "-q", remote, `+${this.ref}:${tracking}`]);
-      const theirs = exists ? this.head(tracking) : null;
-      const merged = theirs ? this.mergeFrom(theirs, remote) : 0;
-      if (!this.head()) return { fetched: exists, merged, pushed: false };
-      const push = spawnSync("git", ["push", "-q", remote, `${this.ref}:${this.ref}`], { cwd: this.root, encoding: "utf8" });
-      if (push.status === 0) return { fetched: exists, merged, pushed: true };
-      // Someone pushed in between; fetch and merge again.
+      const { fetched, merged } = this.pull(remote);
+      const pushed = this.push(remote);
+      if (pushed !== "rejected") return { fetched, merged, pushed: pushed === "pushed" };
     }
     throw new Error(`Could not push ${this.ref} to ${remote}.`);
   }

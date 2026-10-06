@@ -48,15 +48,8 @@ export function importFromCache(store: NoteStore, prs: PullRequest[]): ImportRes
         const fields = {
           comments: [...githubComments(thread), ...(existing?.comments.filter((x) => x.source === "local") ?? [])],
           pr: { number: pr.number, title: pr.title, url: pr.url, state: pr.state },
-          github: {
-            threadId: thread.id,
-            url: thread.comments[0]?.url ?? pr.url,
-            isResolved: thread.isResolved,
-            // A resolution state recorded later (e.g. resolved from the editor) is newer than the cache.
-            checkedAt: existing?.github && existing.github.checkedAt > pr.updatedAt ? existing.github.checkedAt : pr.updatedAt,
-          },
+          github: { threadId: thread.id, url: thread.comments[0]?.url ?? pr.url },
         };
-        if (existing?.github && existing.github.checkedAt > pr.updatedAt) fields.github.isResolved = existing.github.isResolved;
         if (existing) {
           // Notes imported before anchors had context get the context now; their position is unchanged.
           const anchor = existing.anchor.lines ? existing.anchor : threadAnchor(thread, pr);

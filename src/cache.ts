@@ -1,7 +1,6 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Classification } from "./classify.ts";
 import type { FileIndex, FileThread, PullRequest, SyncState } from "./types.ts";
 
 /**
@@ -40,18 +39,9 @@ export class Cache {
     this.write(join("prs", `${pr.number}.json`), pr);
   }
 
-  /** Every cached PR, in file-name order (stable, so seeded samples are reproducible). */
+  /** Every cached PR, in file-name order. */
   readPrs(): PullRequest[] {
     return readdirSync(join(this.dir, "prs")).sort().map((entry) => this.read<PullRequest>(join("prs", entry))!);
-  }
-
-  /** Classifications keyed by thread id; each classifier has its own file. Haiku's is the default. */
-  readClassifications(classifier = "haiku"): Record<string, Classification> {
-    return this.read<Record<string, Classification>>(classificationsFile(classifier)) ?? {};
-  }
-
-  writeClassifications(data: Record<string, Classification>, classifier = "haiku"): void {
-    this.write(classificationsFile(classifier), data);
   }
 
   readIndex(): FileIndex | null {
@@ -76,9 +66,6 @@ export class Cache {
     return index;
   }
 }
-
-const classificationsFile = (classifier: string) =>
-  classifier === "haiku" ? "classifications.json" : `classifications-${classifier}.json`;
 
 /**
  * Threads for a repo-relative path. Windows paths are case-insensitive while GitHub paths are not,

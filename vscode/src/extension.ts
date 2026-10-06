@@ -5,11 +5,12 @@ import { type Located, buildAnchor } from "../../src/anchor.ts";
 import { Cache } from "../../src/cache.ts";
 import { describeLines, describeMatch, originalCode, withoutEmail } from "../../src/format.ts";
 import { type NoteDoc, NoteStore, keyFor, newManualId } from "../../src/gitnotes.ts";
-import { fetchThreadStates, githubDeletionReply, setGithubToken, setThreadResolved } from "../../src/github.ts";
+import { githubDeletionReply, setGithubToken, setThreadResolved } from "../../src/github.ts";
+import { ThreadStates } from "../../src/thread-states.ts";
 import { importFromCache } from "../../src/importer.ts";
 import { type FileNote, RepoNotes, gitDirs } from "../../src/notes.ts";
 import { detectRepo, gitRoot, toRepoPath } from "../../src/repo.ts";
-import { sync } from "../../src/sync.ts";
+import { fetchPrsIntoCache } from "../../src/fetch-prs.ts";
 import { placeNotes } from "../../src/tracking.ts";
 
 interface RepoInfo {
@@ -86,8 +87,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const repoByDir = new Map<string, RepoInfo | null>();
   const knownRepos: RepoInfo[] = [];
   const refWatchers = new Map<string, FSWatcher[]>();
-  /** Last time each GitHub thread's state was checked, so status checks are not repeated on every render. */
-  const githubCheckedAt = new Map<string, number>();
+  /** Threads whose GitHub state is being looked up, so a render does not start a second lookup. */
+  const lookingUp = new Set<string>();
 
   const log = (msg: string) => output.appendLine(`[${new Date().toLocaleTimeString()}] ${msg}`);
 
@@ -171,11 +172,12 @@ export function activate(context: vscode.ExtensionContext): void {
         const placed = placeNotes(found.info.root, found.notes.map((n) => n.doc), lines);
         const expand = vscode.workspace.getConfiguration("codeNotes").get<"none" | "all">("expand", "none");
         threadsByDoc.set(doc.uri.toString(), found.notes.map((note, i) => {
-          const thread = createThread(controller, doc, found.info.root, note, placed[i], expand);
+          const resolved = note.doc.github ? new ThreadStates(found.info.root).get(note.doc.github.threadId) : undefined;
+          const thread = createThread(controller, doc, found.info.root, note, placed[i], expand, resolved);
           threadInfo.set(thread, { root: found.info.root, key: note.key, doc: note.doc });
           return thread;
         }));
-        refreshGithubStates(found.info.root, found.notes);
+        refreshGithubStates(found.info.root, found.notes, doc.uri.fsPath);
       }
     }
     showRangesFor(doc);
@@ -220,28 +222,22 @@ export function activate(context: vscode.ExtensionContext): void {
     return !!session;
   };
 
-  /** Checks GitHub for the current state of the threads behind the notes on a file (at most every 5 minutes). */
-  const refreshGithubStates = (root: string, notes: FileNote[]) => {
-    const stale = notes.filter((n) => n.doc.github && Date.now() - (githubCheckedAt.get(n.doc.github.threadId) ?? 0) > 5 * 60_000);
-    if (stale.length === 0) return;
-    for (const n of stale) githubCheckedAt.set(n.doc.github!.threadId, Date.now());
+  /**
+   * Looks up on GitHub whether the conversations behind the notes on a file are resolved (cached for a few
+   * minutes) and re-renders the file when an answer arrives. Needs a GitHub sign-in; without one, nothing is shown.
+   */
+  const refreshGithubStates = (root: string, notes: FileNote[], fsPath: string) => {
+    const states = new ThreadStates(root);
+    const missing = notes.flatMap((n) => (n.doc.github && states.get(n.doc.github.threadId) === undefined && !lookingUp.has(n.doc.github.threadId) ? [n.doc.github.threadId] : []));
+    if (missing.length === 0) return;
+    missing.forEach((id) => lookingUp.add(id));
     (async () => {
       if (!(await githubSession(false))) return;
-      const states = await fetchThreadStates(stale.map((n) => n.doc.github!.threadId));
-      const store = new NoteStore(root);
-      let changed = false;
-      for (const n of stale) {
-        const state = states.get(n.doc.github!.threadId);
-        if (state !== undefined && state !== n.doc.github!.isResolved) {
-          store.setGithubResolved(n.key, state);
-          changed = true;
-        }
-      }
-      if (changed) {
-        renderAll();
-        syncAfterChange(root);
-      }
-    })().catch((err) => log(`GitHub status check failed: ${(err as Error).message}`));
+      await states.refresh(missing);
+      renderPath(fsPath);
+    })()
+      .catch((err) => log(`GitHub status check failed: ${(err as Error).message}`))
+      .finally(() => missing.forEach((id) => lookingUp.delete(id)));
   };
 
   const setResolved = (resolved: boolean) => async (thread: vscode.CommentThread) => {
@@ -249,10 +245,9 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!t?.doc.github) return;
     await githubSession(true);
     const state = await setThreadResolved(t.doc.github.threadId, resolved);
-    new NoteStore(t.root).setGithubResolved(t.key, state);
-    log(`${state ? "resolved" : "reopened"} GitHub thread of note ${t.key}`);
+    new ThreadStates(t.root).set(t.doc.github.threadId, state);
+    log(`${state ? "resolved" : "reopened"} GitHub conversation of note ${t.key}`);
     renderPath(thread.uri.fsPath);
-    syncAfterChange(t.root);
   };
 
   const openOnGithub = (thread: vscode.CommentThread) => {
@@ -393,14 +388,16 @@ export function activate(context: vscode.ExtensionContext): void {
     log(`deleted note ${t.key}`);
     renderPath(fsPath);
     syncAfterChange(t.root);
-    // A note from an open GitHub conversation: post the reason there and resolve it.
-    if (t.doc.github && !t.doc.github.isResolved) {
+    // A note from a GitHub conversation that is still open (asked now, not cached): post the reason there and resolve it.
+    if (t.doc.github) {
       try {
         await githubSession(true);
-        const state = await setThreadResolved(t.doc.github.threadId, true, githubDeletionReply(justification));
-        store.setGithubResolved(t.key, state);
-        log(`resolved GitHub conversation of note ${t.key}`);
-        syncAfterChange(t.root);
+        const states = new ThreadStates(t.root, 0);
+        const open = (await states.refresh([t.doc.github.threadId])).get(t.doc.github.threadId) === false;
+        if (open) {
+          states.set(t.doc.github.threadId, await setThreadResolved(t.doc.github.threadId, true, githubDeletionReply(justification)));
+          log(`resolved GitHub conversation of note ${t.key}`);
+        }
       } catch (err) {
         log(`resolving on GitHub failed: ${String((err as Error).stack ?? err)}`);
         vscode.window.showWarningMessage(`Code Notes: the note was deleted, but the GitHub conversation could not be resolved: ${(err as Error).message}`);
@@ -460,7 +457,7 @@ export function activate(context: vscode.ExtensionContext): void {
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: `Code Notes: importing ${cache.repo}` },
       async (progress) => {
-        await sync(cache, { limit: config.get("syncLimit", 300), full: false, log: (m) => { log(m); progress.report({ message: m }); } });
+        await fetchPrsIntoCache(cache, { limit: config.get("importLimit", 300), full: false, log: (m) => { log(m); progress.report({ message: m }); } });
         const r = importFromCache(store, cache.readPrs());
         vscode.window.showInformationMessage(
           `Code Notes: ${r.added} notes added, ${r.updated} updated, ${r.skippedDeleted} skipped because deleted.`);
@@ -515,6 +512,7 @@ function createThread(
   note: FileNote,
   range: Located | null,
   expand: "none" | "all",
+  githubResolved?: boolean,
 ): vscode.CommentThread {
   const lastLine = Math.max(doc.lineCount - 1, 0);
   const start = Math.min((range?.start ?? 1) - 1, lastLine);
@@ -538,10 +536,11 @@ function createThread(
   thread.canReply = true;
   const heading = d.summary ?? d.comments[0]?.body.split(/\r?\n/)[0].slice(0, 100) ?? "";
   const match = describeMatch(range, d.anchor);
-  const githubState = d.github ? ` · ${d.github.isResolved ? "resolved" : "open"} on GitHub` : "";
+  const githubState = d.github && githubResolved !== undefined ? ` · ${githubResolved ? "resolved" : "open"} on GitHub` : "";
   thread.label = `${describeLines(range)}${match ? ` (${match})` : ""}${note.originalPath ? ` · was ${note.originalPath}` : ""}${githubState}: ${heading}`;
-  thread.contextValue = d.github ? (d.github.isResolved ? "codeNote-github-resolved" : "codeNote-github-open") : "codeNote";
-  if (d.github) thread.state = d.github.isResolved ? vscode.CommentThreadState.Resolved : vscode.CommentThreadState.Unresolved;
+  // The resolve/reopen buttons need the GitHub state; until it is known only "open on GitHub" is offered.
+  thread.contextValue = !d.github ? "codeNote" : githubResolved === undefined ? "codeNote-github" : githubResolved ? "codeNote-github-resolved" : "codeNote-github-open";
+  if (d.github && githubResolved !== undefined) thread.state = githubResolved ? vscode.CommentThreadState.Resolved : vscode.CommentThreadState.Unresolved;
   thread.collapsibleState = expand === "all"
     ? vscode.CommentThreadCollapsibleState.Expanded
     : vscode.CommentThreadCollapsibleState.Collapsed;

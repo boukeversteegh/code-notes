@@ -2,7 +2,7 @@
   "name": "code-notes",
   "displayName": "Code Notes: PR review history",
   "description": "Shared code notes stored in git notes: past GitHub PR review conversations and notes you write, shown on the lines they belong to.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "publisher": "boukeversteegh",
   "private": true,
   "engines": {
@@ -105,15 +105,15 @@
           "default": true,
           "description": "After adding, replying to or deleting a note, sync notes with the remote set in `git config code-notes.remote`. Without that setting notes stay local."
         },
-        "codeNotes.syncLimit": {
-          "type": "number",
-          "default": 300,
-          "description": "Maximum number of PRs fetched from GitHub per import."
-        },
         "codeNotes.pullInterval": {
           "type": "number",
           "default": 60,
           "description": "Seconds between automatic pulls of notes from the remote set in `git config code-notes.remote` (also pulled when the window gains focus). 0 turns periodic pulls off."
+        },
+        "codeNotes.importLimit": {
+          "type": "number",
+          "default": 300,
+          "description": "Maximum number of PRs fetched from GitHub per import."
         }
       }
     },

@@ -53,15 +53,31 @@ after(() => rmSync(base, { recursive: true, force: true }));
 
 let shared: string;
 
-test("a note added in one clone is readable in another after sync-notes", () => {
+test("a note added in one clone is readable in another after sync", () => {
   shared = manualNote(new NoteStore(a), "a.txt", 3, 4, "Remember the edge case on these lines.");
   assert.match(cli(a, "show", "a.txt"), /Remember the edge case/);
-  assert.match(cli(a, "sync-notes"), /Pushed/);
-  assert.match(cli(b, "sync-notes"), /merged|Pushed/);
+  assert.match(cli(a, "sync"), /Pushed/);
+  assert.match(cli(b, "sync"), /merged|Pushed/);
   const shown = cli(b, "show", "a.txt");
   assert.match(shown, /Remember the edge case/);
   assert.match(shown, new RegExp(`key: \`${shared}\``));
   assert.match(shown, /L3-4/);
+});
+
+test("push is rejected while the remote has notes that are not here; pull merges them", () => {
+  const fromB = manualNote(new NoteStore(b), "a.txt", 2, 2, "Written in B.");
+  cli(b, "push");
+  const fromA = manualNote(new NoteStore(a), "a.txt", 5, 5, "Written in A.");
+  assert.throws(() => cli(a, "push"), /Push rejected/);
+  assert.match(cli(a, "pull"), /Pulled: 1 notes merged/);
+  assert.match(cli(a, "push"), /Pushed/);
+  cli(b, "pull");
+  const shown = cli(b, "show", "a.txt");
+  assert.match(shown, /Written in A/);
+  assert.match(shown, /Written in B/);
+  for (const key of [fromA, fromB]) cli(a, "delete", key, "--reason", "test cleanup");
+  cli(a, "sync");
+  cli(b, "sync");
 });
 
 test("a worktree sees notes from its main checkout without syncing", () => {
@@ -74,9 +90,9 @@ test("a worktree sees notes from its main checkout without syncing", () => {
 test("a deletion in one clone spreads to the other and wins over a concurrent edit", () => {
   cli(a, "comment", shared, "-m", "Still relevant?");
   cli(b, "delete", shared, "--reason", "fixed in the meantime", "--by", "agent:claude");
-  cli(b, "sync-notes");
-  cli(a, "sync-notes");
-  cli(b, "sync-notes");
+  cli(b, "sync");
+  cli(a, "sync");
+  cli(b, "sync");
   for (const dir of [a, b]) assert.doesNotMatch(cli(dir, "show", "a.txt"), /Remember the edge case/);
   const doc = new NoteStore(a).get(shared)!;
   assert.equal(doc.deleted?.by, "agent:claude");
@@ -85,8 +101,8 @@ test("a deletion in one clone spreads to the other and wins over a concurrent ed
 
 test("restore brings a deleted note back everywhere", () => {
   cli(a, "restore", shared);
-  cli(a, "sync-notes");
-  cli(b, "sync-notes");
+  cli(a, "sync");
+  cli(b, "sync");
   assert.match(cli(b, "show", "a.txt"), /Remember the edge case/);
 });
 
@@ -110,8 +126,8 @@ test("a re-import from GitHub does not bring back a deleted conversation", () =>
   assert.doesNotMatch(cli(a, "show", "a.txt"), /postpone this to TICKET-1/);
   // The other clone imports the same conversation independently; the tombstone still wins after syncing.
   importFromCache(new NoteStore(b), [pr]);
-  cli(a, "sync-notes");
-  cli(b, "sync-notes");
+  cli(a, "sync");
+  cli(b, "sync");
   assert.doesNotMatch(cli(b, "show", "a.txt"), /postpone this to TICKET-1/);
 });
 
