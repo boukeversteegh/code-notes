@@ -55,9 +55,27 @@ const handlers: Record<string, (a: Args, log: (msg: string) => void) => unknown>
       return null;
     }
   },
-  notesForFile: ({ info, path, lines }) => {
-    const notes = notesOf(info).forFile(path);
+  /** The notes of a file plus `extra` notes that are not stored (the branch PR's conversations), placed in `lines`. */
+  notesForFile: ({ info, path, lines, extra = [] }) => {
+    const stored = notesOf(info).forFile(path);
+    const storedKeys = new Set(stored.map((n) => n.key));
+    const notes = [...stored, ...(extra as typeof stored).filter((n) => !storedKeys.has(n.key))];
     return { notes, placed: notes.length ? placeNotes(info.root, notes.map((n) => n.doc), lines) : [] };
+  },
+  branch: ({ root }) => {
+    try {
+      return new NoteStore(root).git(["symbolic-ref", "--short", "-q", "HEAD"]).trim() || null;
+    } catch {
+      return null; // detached HEAD
+    }
+  },
+  githubRepo: ({ root }) => {
+    const configured = new NoteStore(root).git(["config", "--default", "", "--get", "code-notes.github"]).trim();
+    try {
+      return configured || detectRepo(root);
+    } catch {
+      return null; // origin is not on GitHub
+    }
   },
   count: ({ info, path }) => notesOf(info).count(path),
   head: ({ root }) => new NoteStore(root).head(),

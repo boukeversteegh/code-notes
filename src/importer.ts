@@ -18,6 +18,28 @@ function threadAnchor(thread: ReviewThread, pr: PullRequest) {
   return anchorFromHunk(thread.diffHunk, range.start, range.end, thread.diffSide, commit);
 }
 
+/** The note document for a GitHub review thread, as the import writes it. */
+export function threadNote(thread: ReviewThread, pr: PullRequest, now = new Date().toISOString()): { key: string; doc: NoteDoc } {
+  return {
+    key: keyFor(`github-review-thread:${thread.id}`),
+    doc: {
+      schema: 1,
+      id: `github-review-thread:${thread.id}`,
+      source: "github-review",
+      path: thread.path,
+      anchor: threadAnchor(thread, pr),
+      summary: null,
+      comments: githubComments(thread),
+      pr: { number: pr.number, title: pr.title, url: pr.url, state: pr.state },
+      github: { threadId: thread.id, url: thread.comments[0]?.url ?? pr.url },
+      createdAt: thread.comments[0]?.createdAt ?? now,
+      updatedAt: now,
+      deleted: null,
+      restoredAt: null,
+    },
+  };
+}
+
 const githubComments = (t: ReviewThread): NoteComment[] =>
   t.comments.map((c) => ({ author: c.author, body: c.body, createdAt: c.createdAt, url: c.url, source: "github" }));
 

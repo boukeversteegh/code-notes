@@ -5,7 +5,9 @@ import * as vscode from "vscode";
 import { type Located, buildAnchor } from "../../src/anchor.ts";
 import { describeLines, describeMatch, originalCode, withoutEmail } from "../../src/format.ts";
 import { type NoteDoc, keyFor, newManualId } from "../../src/gitnotes.ts";
-import { githubDeletionReply, setGithubToken, setThreadResolved } from "../../src/github.ts";
+import { fetchPullRequestsForBranch, githubDeletionReply, setGithubToken, setThreadResolved } from "../../src/github.ts";
+import { threadNote } from "../../src/importer.ts";
+import type { PullRequest, ReviewThread } from "../../src/types.ts";
 import type { FileNote } from "../../src/notes.ts";
 import { toRepoPath } from "../../src/repo.ts";
 import { ThreadStates } from "../../src/thread-states.ts";
@@ -132,13 +134,29 @@ export function activate(context: vscode.ExtensionContext): void {
     status.text = "$(comment-discussion) Code Notes";
     status.tooltip = `Code Notes${lastSync ? ` · last synced ${lastSync.toLocaleTimeString()}` : ""}\nClick to sync notes with the remote.`;
   };
-  git.onBusyChange = (activities) => {
+  /** Activities running on this thread (GitHub requests), shown together with the worker's. */
+  const ownActivities = new Map<string, number>();
+  const updateStatus = () => {
+    const activities = [...new Set([...git.activities(), ...ownActivities.keys()])];
     clearTimeout(statusTimer);
     if (activities.length === 0) return showIdle();
     statusTimer = setTimeout(() => {
       status.text = `$(sync~spin) Code Notes: ${activities.join(", ")}…`;
       status.tooltip = "Code Notes is working in the background.";
     }, 300);
+  };
+  git.onBusyChange = updateStatus;
+  const track = async <T>(activity: string, work: Promise<T>): Promise<T> => {
+    ownActivities.set(activity, (ownActivities.get(activity) ?? 0) + 1);
+    updateStatus();
+    try {
+      return await work;
+    } finally {
+      const n = (ownActivities.get(activity) ?? 1) - 1;
+      if (n > 0) ownActivities.set(activity, n);
+      else ownActivities.delete(activity);
+      updateStatus();
+    }
   };
   /** Shows the outcome of a manual sync in the status item for a few seconds (not as a second status bar entry). */
   let resultTimer: NodeJS.Timeout | undefined;
@@ -182,6 +200,7 @@ export function activate(context: vscode.ExtensionContext): void {
         background("looking up the git identity", git.call<string>("author", { root: info.root }).then((a) => authors.set(info.root, a)));
         // Pull right away, so a fresh clone shows the shared notes without waiting for the next periodic pull.
         background(`pull ${info.root}`, syncRepo(info.root));
+        background(`loading the pull request of ${info.root}`, refreshBranchPrs(info.root));
         return info;
       }));
     }
@@ -206,6 +225,12 @@ export function activate(context: vscode.ExtensionContext): void {
       })), 300);
     };
     const watchers = [watch(notesDir, changed)];
+    // A checkout changes the worktree's HEAD: look up the pull request of the new branch right away.
+    let headTimer: NodeJS.Timeout | undefined;
+    watchers.push(watch(join(info.gitDir, "HEAD"), () => {
+      clearTimeout(headTimer);
+      headTimer = setTimeout(() => background(`loading the pull request of ${info.root}`, refreshBranchPrs(info.root)), 500);
+    }));
     if (existsSync(join(info.commonDir, "packed-refs"))) watchers.push(watch(join(info.commonDir, "packed-refs"), changed));
     refWatchers.set(info.commonDir, watchers);
   };
@@ -249,8 +274,9 @@ export function activate(context: vscode.ExtensionContext): void {
     if (doc.uri.scheme === "file") {
       const info = await repoFor(doc.uri.fsPath);
       if (info) {
+        const path = toRepoPath(doc.uri.fsPath, info.root, info.root);
         const r = await git.call<{ notes: FileNote[]; placed: (Located | null)[] }>("notesForFile", {
-          info, path: toRepoPath(doc.uri.fsPath, info.root, info.root), lines: doc.getText().split(/\r?\n/),
+          info, path, lines: doc.getText().split(/\r?\n/), extra: branchConversations(info.root, path),
         });
         found = { info, ...r };
       }
@@ -264,7 +290,9 @@ export function activate(context: vscode.ExtensionContext): void {
       const expand = vscode.workspace.getConfiguration("codeNotes").get<"none" | "all">("expand", "none");
       const states = new ThreadStates(info.root);
       notes.forEach((note, i) => {
-        const resolved = note.doc.github ? states.get(note.doc.github.threadId) : undefined;
+        // The branch PR's conversations come fresh from GitHub, including whether they are resolved.
+        const fromBranchPr = branchThread(info.root, note.key);
+        const resolved = fromBranchPr ? fromBranchPr.isResolved : note.doc.github ? states.get(note.doc.github.threadId) : undefined;
         const signature = JSON.stringify([note.doc, placed[i], resolved, note.originalPath]);
         const old = previous.get(note.key);
         if (old?.signature === signature) {
@@ -272,12 +300,12 @@ export function activate(context: vscode.ExtensionContext): void {
           return;
         }
         const thread = old?.thread ?? createThread(controller, doc, expand);
-        fillThread(thread, doc, info.root, note, placed[i], resolved);
+        fillThread(thread, doc, info.root, note, placed[i], resolved, undefined, !!fromBranchPr);
         if (keepOpen.delete(note.key)) thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
         threadInfo.set(thread, { root: info.root, key: note.key, doc: note.doc });
         next.set(note.key, { thread, signature });
       });
-      refreshGithubStates(info.root, notes, doc.uri.fsPath);
+      refreshGithubStates(info.root, notes.filter((n) => !branchThread(info.root, n.key)), doc.uri.fsPath);
     }
     for (const [key, r] of previous) if (!next.has(key)) r.thread.dispose();
     if (next.size) threadsByDoc.set(uri, next);
@@ -367,6 +395,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const state = await setThreadResolved(t.doc.github.threadId, resolved);
     new ThreadStates(t.root).set(t.doc.github.threadId, state);
     log(`${state ? "resolved" : "reopened"} GitHub conversation of note ${t.key}`);
+    if (branchThread(t.root, t.key)) await refreshBranchPrs(t.root);
     renderPath(thread.uri.fsPath);
   };
 
@@ -375,6 +404,90 @@ export function activate(context: vscode.ExtensionContext): void {
     const url = t?.doc.github?.url ?? t?.doc.pr?.url;
     if (url) vscode.env.openExternal(vscode.Uri.parse(url));
   };
+
+  // ---- The pull request(s) of the current branch: read live from GitHub, shown in a view and inline ----
+
+  const branchPrs = new Map<string, { branch: string | null; prs: PullRequest[] }>();
+  /** Review threads of the branch PRs by note key, per repository root. */
+  const branchThreads = new Map<string, Map<string, ReviewThread>>();
+  const branchThread = (root: string, key: string) => branchThreads.get(root)?.get(key);
+
+  /** The branch PRs' conversations on one file, as notes (not stored; only shown). */
+  const branchConversations = (root: string, path: string): FileNote[] =>
+    (branchPrs.get(root)?.prs ?? []).flatMap((pr) =>
+      pr.threads.filter((t) => t.path === path).map((t) => ({ ...threadNote(t, pr, pr.updatedAt), originalPath: null })));
+
+  const prTreeChanged = new vscode.EventEmitter<void>();
+
+  /** Looks up the pull requests of the repository's current branch on GitHub. Needs a GitHub sign-in. */
+  const refreshBranchPrs = async (root: string) => {
+    const [branch, repo] = await Promise.all([git.call<string | null>("branch", { root }), git.call<string | null>("githubRepo", { root })]);
+    let prs: PullRequest[] = [];
+    if (branch && repo && (await githubSession(false))) prs = await track("loading pull request", fetchPullRequestsForBranch(repo, branch));
+    const changed = JSON.stringify(branchPrs.get(root)) !== JSON.stringify({ branch, prs });
+    branchPrs.set(root, { branch, prs });
+    branchThreads.set(root, new Map(prs.flatMap((pr) => pr.threads.map((t) => [threadNote(t, pr).key, t] as [string, ReviewThread]))));
+    if (changed) {
+      prTreeChanged.fire();
+      renderAll();
+    }
+  };
+  const refreshAllBranchPrs = () =>
+    Promise.all([...new Map(knownRepos.map((r) => [r.root, r])).values()].map((r) => background(`loading the pull request of ${r.root}`, refreshBranchPrs(r.root))));
+
+  type PrNode =
+    | { kind: "pr"; root: string; pr: PullRequest }
+    | { kind: "file"; root: string; pr: PullRequest; path: string; threads: ReviewThread[] }
+    | { kind: "thread"; root: string; pr: PullRequest; thread: ReviewThread };
+
+  /** Tree: pull request (with an open button) > file > review conversation (opens the file at its line). */
+  const prTree: vscode.TreeDataProvider<PrNode> = {
+    onDidChangeTreeData: prTreeChanged.event,
+    getChildren(node) {
+      if (!node) return [...branchPrs].flatMap(([root, { prs }]) => prs.map((pr) => ({ kind: "pr" as const, root, pr })));
+      if (node.kind === "pr") {
+        const byPath = new Map<string, ReviewThread[]>();
+        for (const t of node.pr.threads) byPath.set(t.path, [...(byPath.get(t.path) ?? []), t]);
+        return [...byPath].sort(([a], [b]) => a.localeCompare(b)).map(([path, threads]) => ({ kind: "file" as const, root: node.root, pr: node.pr, path, threads }));
+      }
+      if (node.kind === "file") {
+        return [...node.threads].sort((a, b) => (a.line ?? a.originalLine ?? 0) - (b.line ?? b.originalLine ?? 0))
+          .map((thread) => ({ kind: "thread" as const, root: node.root, pr: node.pr, thread }));
+      }
+      return [];
+    },
+    getTreeItem(node) {
+      if (node.kind === "pr") {
+        const item = new vscode.TreeItem(`#${node.pr.number} ${node.pr.title}`, vscode.TreeItemCollapsibleState.Expanded);
+        const open = node.pr.threads.filter((t) => !t.isResolved).length;
+        item.description = `${node.pr.state.toLowerCase()} · ${node.pr.threads.length} conversation${node.pr.threads.length === 1 ? "" : "s"}${open ? `, ${open} open` : ""}`;
+        item.iconPath = new vscode.ThemeIcon("git-pull-request");
+        item.tooltip = node.pr.url;
+        item.contextValue = "branchPr";
+        return item;
+      }
+      if (node.kind === "file") {
+        const item = new vscode.TreeItem(vscode.Uri.file(join(node.root, node.path)), vscode.TreeItemCollapsibleState.Expanded);
+        item.description = `${dirname(node.path) === "." ? "" : dirname(node.path)} · ${node.threads.length}`;
+        return item;
+      }
+      const t = node.thread, first = t.comments[0];
+      const line = t.line ?? t.originalLine;
+      const item = new vscode.TreeItem(truncate(first?.body.split(/\r?\n/).find((l) => l.trim()) ?? "", 100));
+      item.description = [line ? `L${line}` : null, first?.author, t.comments.length > 1 ? `${t.comments.length - 1} repl${t.comments.length === 2 ? "y" : "ies"}` : null, t.isResolved ? "resolved" : null]
+        .filter(Boolean).join(" · ");
+      item.iconPath = new vscode.ThemeIcon(t.isResolved ? "pass" : "comment");
+      item.tooltip = new vscode.MarkdownString(t.comments.map((c) => `**@${c.author}**: ${c.body}`).join("\n\n---\n\n"));
+      const uri = vscode.Uri.file(join(node.root, t.path));
+      item.command = {
+        command: "vscode.open", title: "Open",
+        arguments: [uri, line ? { selection: new vscode.Range(line - 1, 0, line - 1, 0) } : {}],
+      };
+      return item;
+    },
+  };
+
+  const openPr = (node: PrNode) => vscode.env.openExternal(vscode.Uri.parse(node.pr.url));
 
   // ---- Sync (in the worker) ----
 
@@ -414,6 +527,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   /** Pulls notes for every repo seen so far: when the window gains focus and every `codeNotes.pullInterval` seconds. */
   const pullAll = () => {
+    refreshAllBranchPrs();
     for (const info of new Map(knownRepos.map((r) => [r.commonDir, r])).values()) background(`pull ${info.root}`, syncRepo(info.root));
   };
   let pullTimer: NodeJS.Timeout | undefined;
@@ -595,7 +709,7 @@ export function activate(context: vscode.ExtensionContext): void {
   /** Syncs the notes of every known repository with its remote (pull and push), then re-renders. */
   const refresh = async () => {
     const repos = [...new Map(knownRepos.map((r) => [r.commonDir, r])).values()];
-    const results = await Promise.all(repos.map((r) => syncRepo(r.root)));
+    const [results] = await Promise.all([Promise.all(repos.map((r) => syncRepo(r.root))), refreshAllBranchPrs()]);
     const merged = results.reduce((n, r) => n + (r?.merged ?? 0), 0);
     renderAll();
     showResult(`synced${merged ? `, ${merged} note${merged === 1 ? "" : "s"} merged` : ""}`);
@@ -642,6 +756,9 @@ export function activate(context: vscode.ExtensionContext): void {
     register("codeNotes.syncNotes", "syncing", syncNotes),
     register("codeNotes.importGithub", "importing", importGithub),
     register("codeNotes.refresh", "refreshing", refresh),
+    register("codeNotes.openPr", "opening the pull request", openPr),
+    vscode.window.registerTreeDataProvider("codeNotes.branchPr", prTree),
+    prTreeChanged,
     vscode.window.onDidChangeVisibleTextEditors(visibleChanged),
     // Comment threads move with edits; keep the gutter bars on the same lines.
     vscode.workspace.onDidChangeTextDocument((e) => showRangesFor(e.document)),
@@ -681,6 +798,7 @@ function fillThread(
   range: Located | null,
   githubResolved?: boolean,
   firstCommentLabel?: string,
+  fromBranchPr = false,
 ): void {
   const lastLine = Math.max(doc.lineCount - 1, 0);
   const start = Math.min((range?.start ?? 1) - 1, lastLine);
@@ -699,7 +817,9 @@ function fillThread(
     const author: vscode.CommentAuthorInformation = c.source === "github"
       ? { name: c.author, iconPath: vscode.Uri.parse(`https://avatars.githubusercontent.com/${encodeURIComponent(c.author)}?s=64`) }
       : { name: withoutEmail(c.author) };
-    return new NoteComment(body, author, new Date(c.createdAt), root, note.key, i, c.source === "local", label, c.createdAt);
+    const comment = new NoteComment(body, author, new Date(c.createdAt), root, note.key, i, c.source === "local", label, c.createdAt);
+    if (fromBranchPr) comment.contextValue = "pr-review"; // no edit or delete buttons
+    return comment;
   });
   // Only assign what changed: reassigning an identical range can make VS Code redraw the thread collapsed.
   if (!thread.range || thread.range.start.line !== start || thread.range.end.line !== end) {
@@ -713,6 +833,7 @@ function fillThread(
   const status = [
     describeLines(range),
     d.pr ? `PR #${d.pr.number} ${truncate(d.pr.title, 80)}` : `note by ${withoutEmail(d.comments[0]?.author ?? "unknown")}`,
+    fromBranchPr ? "this branch's PR" : null,
     d.github && githubResolved !== undefined ? (githubResolved ? "resolved on GitHub" : "open on GitHub") : null,
     match || null,
     note.originalPath ? `was ${note.originalPath}` : null,
@@ -721,8 +842,12 @@ function fillThread(
   const label = d.summary ? `${status}: ${d.summary}` : status;
   if (thread.label !== label) thread.label = label;
   // The resolve/reopen buttons need the GitHub state; until it is known only "open on GitHub" is offered.
-  const contextValue = !d.github ? "codeNote" : githubResolved === undefined ? "codeNote-github" : githubResolved ? "codeNote-github-resolved" : "codeNote-github-open";
+  const contextValue = fromBranchPr
+    ? (githubResolved ? "branchPr-resolved" : "branchPr-open")
+    : !d.github ? "codeNote" : githubResolved === undefined ? "codeNote-github" : githubResolved ? "codeNote-github-resolved" : "codeNote-github-open";
   if (thread.contextValue !== contextValue) thread.contextValue = contextValue;
+  const canReply = !fromBranchPr; // replies to a PR under review belong on GitHub
+  if (thread.canReply !== canReply) thread.canReply = canReply;
   if (d.github && githubResolved !== undefined) {
     const state = githubResolved ? vscode.CommentThreadState.Resolved : vscode.CommentThreadState.Unresolved;
     if (thread.state !== state) thread.state = state;

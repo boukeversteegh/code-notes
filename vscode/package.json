@@ -2,7 +2,7 @@
   "name": "code-notes",
   "displayName": "Code Notes: PR review history",
   "description": "Shared code notes stored in git notes: past GitHub PR review conversations and notes you write, shown on the lines they belong to.",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "publisher": "boukeversteegh",
   "private": true,
   "engines": {
@@ -93,6 +93,12 @@
         "title": "Delete reply",
         "category": "Code Notes",
         "icon": "$(trash)"
+      },
+      {
+        "command": "codeNotes.openPr",
+        "title": "Open pull request on GitHub",
+        "category": "Code Notes",
+        "icon": "$(link-external)"
       }
     ],
     "configuration": {
@@ -153,17 +159,17 @@
         {
           "command": "codeNotes.resolveOnGithub",
           "group": "navigation@2",
-          "when": "commentController == code-notes && commentThread == codeNote-github-open"
+          "when": "commentController == code-notes && (commentThread == codeNote-github-open || commentThread == branchPr-open)"
         },
         {
           "command": "codeNotes.reopenOnGithub",
           "group": "navigation@2",
-          "when": "commentController == code-notes && commentThread == codeNote-github-resolved"
+          "when": "commentController == code-notes && (commentThread == codeNote-github-resolved || commentThread == branchPr-resolved)"
         },
         {
           "command": "codeNotes.deleteNote",
           "group": "navigation@3",
-          "when": "commentController == code-notes && !commentThreadIsEmpty"
+          "when": "commentController == code-notes && !commentThreadIsEmpty && commentThread != branchPr-open && commentThread != branchPr-resolved"
         }
       ],
       "comments/comment/title": [
@@ -235,6 +241,10 @@
         {
           "command": "codeNotes.deleteComment",
           "when": "false"
+        },
+        {
+          "command": "codeNotes.openPr",
+          "when": "false"
         }
       ],
       "view/title": [
@@ -242,9 +252,35 @@
           "command": "codeNotes.refresh",
           "group": "navigation",
           "when": "view == workbench.panel.comments"
+        },
+        {
+          "command": "codeNotes.refresh",
+          "group": "navigation",
+          "when": "view == codeNotes.branchPr"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "codeNotes.openPr",
+          "group": "inline",
+          "when": "view == codeNotes.branchPr && viewItem == branchPr"
         }
       ]
-    }
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "codeNotes.branchPr",
+          "name": "Branch Pull Request"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "codeNotes.branchPr",
+        "contents": "No pull request found for the current branch, or not signed in to GitHub.\n[Refresh](command:codeNotes.refresh)"
+      }
+    ]
   },
   "scripts": {
     "build": "esbuild src/extension.ts src/worker.ts --bundle --platform=node --target=node20 --format=cjs --external:vscode --outdir=dist",

@@ -61,6 +61,21 @@ query($owner: String!, $name: String!, $after: String) {
   rateLimit { remaining resetAt }
 }`;
 
+const BRANCH_PRS_QUERY = `
+query($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(headRefName: $branch, first: 5, orderBy: { field: UPDATED_AT, direction: DESC }) {
+      nodes {
+        number title url state updatedAt mergedAt headRefOid author { login }
+        reviewThreads(first: ${THREADS_PER_PAGE}) {
+          pageInfo { hasNextPage endCursor }
+          nodes { ${THREAD_FIELDS} }
+        }
+      }
+    }
+  }
+}`;
+
 const MORE_THREADS_QUERY = `
 query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
@@ -175,6 +190,13 @@ export async function* fetchPullRequests(repo: string, log: (msg: string) => voi
     for (const pr of nodes) yield await toPullRequest(owner, name, pr);
     after = pageInfo.hasNextPage ? pageInfo.endCursor : null;
   } while (after);
+}
+
+/** The pull requests whose source branch is `branch` (most recently updated first), with their review threads. */
+export async function fetchPullRequestsForBranch(repo: string, branch: string): Promise<PullRequest[]> {
+  const [owner, name] = repo.split("/");
+  const data = await graphql<{ repository: { pullRequests: { nodes: RawPr[] } } }>(BRANCH_PRS_QUERY, { owner, name, branch });
+  return Promise.all(data.repository.pullRequests.nodes.map((pr) => toPullRequest(owner, name, pr)));
 }
 
 /** Current resolution state of review threads, by GraphQL node id. Threads that no longer exist are left out. */
