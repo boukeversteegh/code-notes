@@ -55,6 +55,11 @@ git fetch https://github.com/<owner>/<repo>.git '+refs/pull/*/head:refs/code-not
 - Changes are synced right away (`codeNotes.syncOnChange`), and notes from other clones are pulled when the window gains focus and every `codeNotes.pullInterval` seconds (default 60).
 - Commands: **Code Notes: Sync notes with remote**, **Import GitHub review conversations into notes**, **Reload notes**. `codeNotes.importLimit` caps the number of PRs fetched per import.
 
+## Troubleshooting
+
+- **No notes show up in a fresh clone.** Notes live on `refs/notes/code-notes`, which `git clone` does not fetch. The extension pulls it when it opens the repository (watch **Output › Code Notes**); `code-notes pull` does the same from a terminal. If the remote has no notes yet, someone has to `code-notes import` or add notes and push them first.
+- **Every note shows twice.** Two versions of the extension are running; reload the window (**Developer: Reload Window**).
+
 ## Storage
 
 - All notes live on `refs/notes/code-notes`, in the standard git notes layout. Each note is a JSON document (`NoteDoc` in `src/gitnotes.ts`): path, anchor, comments, PR and GitHub thread reference (id and link), timestamps, and a `deleted` tombstone.

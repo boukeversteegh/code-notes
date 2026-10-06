@@ -114,6 +114,9 @@ export function activate(context: vscode.ExtensionContext): void {
         knownRepos.push(info);
         repoByDir.set(dir, info);
         watchNotesRef(info);
+        // Pull right away, so a fresh clone shows the shared notes without waiting for the next periodic pull.
+        // The ref watcher re-renders when the pull brings notes.
+        setTimeout(() => syncRepo(root).catch((err) => log(`pull ${root} failed: ${(err as Error).message}`)), 0);
       } catch {
         repoByDir.set(dir, null);
       }
@@ -498,6 +501,10 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => clearInterval(pullTimer) },
     { dispose: () => [...refWatchers.values()].flat().forEach((w) => w.close()) },
   );
+  // Discover the repos of the workspace folders now (which pulls their notes), not only when a file is opened.
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    if (folder.uri.scheme === "file") repoFor(join(folder.uri.fsPath, "_"));
+  }
   renderAll();
 }
 
