@@ -2,7 +2,7 @@
   "name": "code-notes",
   "displayName": "Code Notes: PR review history",
   "description": "Shared code notes stored in git notes: past GitHub PR review conversations and notes you write, shown on the lines they belong to.",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "publisher": "boukeversteegh",
   "private": true,
   "engines": {
@@ -93,12 +93,6 @@
         "title": "Delete reply",
         "category": "Code Notes",
         "icon": "$(trash)"
-      },
-      {
-        "command": "codeNotes.closeThread",
-        "title": "Close",
-        "category": "Code Notes",
-        "icon": "$(close)"
       }
     ],
     "configuration": {
@@ -170,11 +164,6 @@
           "command": "codeNotes.deleteNote",
           "group": "navigation@3",
           "when": "commentController == code-notes && !commentThreadIsEmpty"
-        },
-        {
-          "command": "codeNotes.closeThread",
-          "group": "navigation@9",
-          "when": "commentController == code-notes && !commentThreadIsEmpty"
         }
       ],
       "comments/comment/title": [
@@ -245,10 +234,6 @@
         },
         {
           "command": "codeNotes.deleteComment",
-          "when": "false"
-        },
-        {
-          "command": "codeNotes.closeThread",
           "when": "false"
         }
       ],

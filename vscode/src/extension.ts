@@ -104,7 +104,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const threadsByDoc = new Map<string, Map<string, { thread: vscode.CommentThread; signature: string }>>();
   /** Latest render per document; an older render that finishes later is discarded. */
   const renderGeneration = new Map<string, number>();
-  /** Notes you replied to, edited or created in this session; they stay open through re-renders. */
+  /**
+   * Notes you just replied to, edited or created: they stay open through the re-render that follows the save.
+   * After that the note is left as you set it, because VS Code does not tell extensions when you collapse a note.
+   */
   const keepOpen = new Set<string>();
   const threadsOf = (doc: vscode.TextDocument) => [...(threadsByDoc.get(doc.uri.toString())?.values() ?? [])].map((r) => r.thread);
   const threadInfo = new WeakMap<vscode.CommentThread, ThreadInfo>();
@@ -136,6 +139,15 @@ export function activate(context: vscode.ExtensionContext): void {
       status.text = `$(sync~spin) Code Notes: ${activities.join(", ")}…`;
       status.tooltip = "Code Notes is working in the background.";
     }, 300);
+  };
+  /** Shows the outcome of a manual sync in the status item for a few seconds (not as a second status bar entry). */
+  let resultTimer: NodeJS.Timeout | undefined;
+  const showResult = (text: string) => {
+    clearTimeout(resultTimer);
+    status.text = `$(check) Code Notes: ${text}`;
+    resultTimer = setTimeout(() => {
+      if (!git.activities().length) showIdle();
+    }, 3000);
   };
   showIdle();
   status.show();
@@ -261,7 +273,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
         const thread = old?.thread ?? createThread(controller, doc, expand);
         fillThread(thread, doc, info.root, note, placed[i], resolved);
-        if (keepOpen.has(note.key)) thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
+        if (keepOpen.delete(note.key)) thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
         threadInfo.set(thread, { root: info.root, key: note.key, doc: note.doc });
         next.set(note.key, { thread, signature });
       });
@@ -356,16 +368,6 @@ export function activate(context: vscode.ExtensionContext): void {
     new ThreadStates(t.root).set(t.doc.github.threadId, state);
     log(`${state ? "resolved" : "reopened"} GitHub conversation of note ${t.key}`);
     renderPath(thread.uri.fsPath);
-  };
-
-  /**
-   * Closes (collapses) a note. VS Code's own collapse button does not tell the extension it was used, so a
-   * note kept open after a reply could open again on the next re-render; this one also stops keeping it open.
-   */
-  const closeThread = (thread: vscode.CommentThread) => {
-    const t = threadInfo.get(thread);
-    if (t) keepOpen.delete(t.key);
-    thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
   };
 
   const openOnGithub = (thread: vscode.CommentThread) => {
@@ -596,7 +598,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const results = await Promise.all(repos.map((r) => syncRepo(r.root)));
     const merged = results.reduce((n, r) => n + (r?.merged ?? 0), 0);
     renderAll();
-    vscode.window.setStatusBarMessage(`Code Notes: synced${merged ? `, ${merged} notes merged` : ""}`, 3000);
+    showResult(`synced${merged ? `, ${merged} note${merged === 1 ? "" : "s"} merged` : ""}`);
   };
 
   const importGithub = async () => {
@@ -637,7 +639,6 @@ export function activate(context: vscode.ExtensionContext): void {
     register("codeNotes.resolveOnGithub", "resolving on GitHub", setResolved(true)),
     register("codeNotes.reopenOnGithub", "reopening on GitHub", setResolved(false)),
     register("codeNotes.openOnGithub", "opening GitHub", openOnGithub),
-    register("codeNotes.closeThread", "closing the note", closeThread),
     register("codeNotes.syncNotes", "syncing", syncNotes),
     register("codeNotes.importGithub", "importing", importGithub),
     register("codeNotes.refresh", "refreshing", refresh),
