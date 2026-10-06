@@ -2,7 +2,7 @@
   "name": "code-notes",
   "displayName": "Code Notes: PR review history",
   "description": "Shared code notes stored in git notes: past GitHub PR review conversations and notes you write, shown on the lines they belong to.",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "publisher": "boukeversteegh",
   "private": true,
   "engines": {

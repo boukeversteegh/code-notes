@@ -86,6 +86,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const notesCache = new NotesCache();
   /** Rendered threads per document, by note key, with a signature of what they show, so re-renders update in place. */
   const threadsByDoc = new Map<string, Map<string, { thread: vscode.CommentThread; signature: string }>>();
+  /** Notes you replied to, edited or created in this session; they stay open through re-renders. */
+  const keepOpen = new Set<string>();
   const threadsOf = (doc: vscode.TextDocument) => [...(threadsByDoc.get(doc.uri.toString())?.values() ?? [])].map((r) => r.thread);
   const threadInfo = new WeakMap<vscode.CommentThread, ThreadInfo>();
   const repoByDir = new Map<string, RepoInfo | null>();
@@ -203,6 +205,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }
         const thread = old?.thread ?? createThread(controller, doc, expand);
         fillThread(thread, doc, found.info.root, note, placed[i], resolved);
+        if (keepOpen.has(note.key)) thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
         threadInfo.set(thread, { root: found.info.root, key: note.key, doc: note.doc });
         next.set(note.key, { thread, signature });
       });
@@ -366,6 +369,7 @@ export function activate(context: vscode.ExtensionContext): void {
     reply.thread.dispose();
     const range = anchor.endLine ? { start: anchor.startLine!, end: anchor.endLine, match: "exact" as const } : null;
     const shown = createThread(controller, doc, "all");
+    keepOpen.add(key);
     fillThread(shown, doc, info.root, { key, doc: note, originalPath: null }, range);
     threadInfo.set(shown, { root: info.root, key, doc: note });
     const rendered = threadsByDoc.get(doc.uri.toString()) ?? new Map();
@@ -400,6 +404,8 @@ export function activate(context: vscode.ExtensionContext): void {
     const shown = new NoteComment(reply.text, { name: withoutEmail(author) }, new Date(createdAt), t.root, t.key, reply.thread.comments.length, true, undefined, createdAt);
     shown.thread = reply.thread;
     reply.thread.comments = [...reply.thread.comments, shown];
+    keepOpen.add(t.key);
+    reply.thread.collapsibleState = vscode.CommentThreadCollapsibleState.Expanded;
     setTimeout(guarded("saving the reply", () => {
       store.addComment(t.key, { author, body: reply.text, createdAt });
       renderPath(reply.thread.uri.fsPath);
@@ -466,6 +472,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const body = typeof comment.body === "string" ? comment.body : comment.body.value;
     comment.savedBody = body;
     comment.thread.comments = comment.thread.comments.map((c) => (c === comment ? Object.assign(comment, { mode: vscode.CommentMode.Preview }) : c));
+    keepOpen.add(comment.key);
     new NoteStore(comment.root).editComment(comment.key, comment.index, body);
     renderPath(comment.thread.uri.fsPath);
     syncAfterChange(comment.root);
@@ -605,16 +612,24 @@ function fillThread(
     return new NoteComment(body, { name: withoutEmail(c.author) }, new Date(c.createdAt), root, note.key, i, c.source === "local",
       c.editedAt ? "edited" : undefined, c.createdAt);
   });
-  thread.range = new vscode.Range(start, 0, end, doc.lineAt(end).text.length);
+  // Only assign what changed: reassigning an identical range can make VS Code redraw the thread collapsed.
+  if (!thread.range || thread.range.start.line !== start || thread.range.end.line !== end) {
+    thread.range = new vscode.Range(start, 0, end, doc.lineAt(end).text.length);
+  }
   thread.comments = comments;
   for (const c of comments) c.thread = thread;
   const heading = d.summary ?? d.comments[0]?.body.split(/\r?\n/)[0].slice(0, 100) ?? "";
   const match = describeMatch(range, d.anchor);
   const githubState = d.github && githubResolved !== undefined ? ` · ${githubResolved ? "resolved" : "open"} on GitHub` : "";
-  thread.label = `${describeLines(range)}${match ? ` (${match})` : ""}${note.originalPath ? ` · was ${note.originalPath}` : ""}${githubState}: ${heading}`;
+  const label = `${describeLines(range)}${match ? ` (${match})` : ""}${note.originalPath ? ` · was ${note.originalPath}` : ""}${githubState}: ${heading}`;
+  if (thread.label !== label) thread.label = label;
   // The resolve/reopen buttons need the GitHub state; until it is known only "open on GitHub" is offered.
-  thread.contextValue = !d.github ? "codeNote" : githubResolved === undefined ? "codeNote-github" : githubResolved ? "codeNote-github-resolved" : "codeNote-github-open";
-  if (d.github && githubResolved !== undefined) thread.state = githubResolved ? vscode.CommentThreadState.Resolved : vscode.CommentThreadState.Unresolved;
+  const contextValue = !d.github ? "codeNote" : githubResolved === undefined ? "codeNote-github" : githubResolved ? "codeNote-github-resolved" : "codeNote-github-open";
+  if (thread.contextValue !== contextValue) thread.contextValue = contextValue;
+  if (d.github && githubResolved !== undefined) {
+    const state = githubResolved ? vscode.CommentThreadState.Resolved : vscode.CommentThreadState.Unresolved;
+    if (thread.state !== state) thread.state = state;
+  }
 }
 
 /** A thin vertical bar, stretched to the full line height so consecutive lines form one continuous bar. */
