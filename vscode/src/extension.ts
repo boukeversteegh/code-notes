@@ -358,6 +358,16 @@ export function activate(context: vscode.ExtensionContext): void {
     renderPath(thread.uri.fsPath);
   };
 
+  /**
+   * Closes (collapses) a note. VS Code's own collapse button does not tell the extension it was used, so a
+   * note kept open after a reply could open again on the next re-render; this one also stops keeping it open.
+   */
+  const closeThread = (thread: vscode.CommentThread) => {
+    const t = threadInfo.get(thread);
+    if (t) keepOpen.delete(t.key);
+    thread.collapsibleState = vscode.CommentThreadCollapsibleState.Collapsed;
+  };
+
   const openOnGithub = (thread: vscode.CommentThread) => {
     const t = threadInfo.get(thread);
     const url = t?.doc.github?.url ?? t?.doc.pr?.url;
@@ -627,6 +637,7 @@ export function activate(context: vscode.ExtensionContext): void {
     register("codeNotes.resolveOnGithub", "resolving on GitHub", setResolved(true)),
     register("codeNotes.reopenOnGithub", "reopening on GitHub", setResolved(false)),
     register("codeNotes.openOnGithub", "opening GitHub", openOnGithub),
+    register("codeNotes.closeThread", "closing the note", closeThread),
     register("codeNotes.syncNotes", "syncing", syncNotes),
     register("codeNotes.importGithub", "importing", importGithub),
     register("codeNotes.refresh", "refreshing", refresh),
